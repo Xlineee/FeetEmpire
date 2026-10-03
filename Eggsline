@@ -381,7 +381,7 @@ local function doBank(state)
         wdPending = { t = os.clock(), cash = cash }
         stats.withdraws += 1
         stats.withdrawn += amount
-        note(string.format("Withdrew $%d from bank", amount))
+        note(string.format("Withdraw $%d from bank", amount))
     end
 end
 
@@ -1383,8 +1383,292 @@ local function closeAnim(done)
     end)
 end
 
+-- ===== WELCOME SIGN (HD): sapaan sesuai jam PC, blur + glass, lalu UI muncul =====
+-- Dibuat TANPA CanvasGroup & TANPA animasi scale pada teks (itu yang bikin teks buram).
+-- Semua elemen di-fade satu per satu, posisi dibulatkan ke pixel penuh -> teks tajam.
+local welcomeActive = true
+local playWelcome
+do
+    main.Visible = false -- window disembunyikan penuh sampai welcome sign selesai (openAnim akan menampilkannya)
+    local Lighting = game:GetService("Lighting")
+
+    -- Jam LOKAL PC (os.date di client = waktu komputer, bukan UTC)
+    -- 05:00-11:59 morning | 12:00-17:59 afternoon | 18:00-04:59 night
+    local function getGreeting()
+        local ok, t = pcall(os.date, "*t")
+        local h = (ok and type(t) == "table" and t.hour) or tonumber(os.date("%H")) or 0
+        if h >= 5 and h < 12 then
+            return "Good morning", "morning", Color3.fromRGB(255, 208, 84)
+        elseif h >= 12 and h < 18 then
+            return "Good afternoon", "afternoon", Color3.fromRGB(255, 160, 72)
+        end
+        return "Good night", "night", Color3.fromRGB(140, 170, 255)
+    end
+
+    -- ----- helper fade (per elemen, tanpa CanvasGroup) -----
+    local function withDesc(o)
+        local t = { o }
+        for _, d in ipairs(o:GetDescendants()) do t[#t + 1] = d end
+        return t
+    end
+
+    local function collect(list)
+        local recs = {}
+        for _, o in ipairs(list) do
+            if o:IsA("UIStroke") then
+                recs[#recs + 1] = { o, "Transparency", o.Transparency }
+            elseif o:IsA("GuiObject") then
+                if o.BackgroundTransparency < 1 then
+                    recs[#recs + 1] = { o, "BackgroundTransparency", o.BackgroundTransparency }
+                end
+                if o:IsA("TextLabel") then
+                    recs[#recs + 1] = { o, "TextTransparency", o.TextTransparency }
+                end
+            end
+        end
+        return function(a) -- a: 0 = hilang, 1 = tampil penuh
+            for _, r in ipairs(recs) do r[1][r[2]] = 1 - (1 - r[3]) * a end
+        end
+    end
+
+    local function animate(fn, from, to, dur, style, dir)
+        local v = Instance.new("NumberValue")
+        v.Value = from
+        local conn = v.Changed:Connect(fn)
+        local tw = TweenService:Create(v, TweenInfo.new(dur, style or Enum.EasingStyle.Quint, dir or Enum.EasingDirection.Out), { Value = to })
+        tw.Completed:Connect(function()
+            conn:Disconnect()
+            v:Destroy()
+        end)
+        fn(from)
+        tw:Play()
+    end
+
+    -- ----- ikon vektor (tajam di semua resolusi, tanpa emoji) -----
+    local function circle(parent, d, x, y, color, transp)
+        local f = new("Frame", {
+            Size = UDim2.fromOffset(d, d), Position = UDim2.fromOffset(math.floor(x - d / 2 + 0.5), math.floor(y - d / 2 + 0.5)),
+            BackgroundColor3 = color, BackgroundTransparency = transp or 0, BorderSizePixel = 0,
+        }, parent)
+        new("UICorner", { CornerRadius = UDim.new(1, 0) }, f)
+        return f
+    end
+
+    local function makeIcon(parent, kind, accent)
+        circle(parent, 76, 40, 40, accent, 0.84) -- glow lembut
+        if kind == "night" then
+            local moon = Color3.fromRGB(228, 234, 255)
+            local ring = circle(parent, 56, 40, 40, moon, 1)
+            new("UIStroke", { Color = accent, Thickness = 2, Transparency = 0.45 }, ring)
+            circle(parent, 44, 40, 40, moon, 0)
+            local crater = Color3.fromRGB(184, 196, 232)
+            circle(parent, 10, 32, 34, crater, 0)
+            circle(parent, 8, 49, 44, crater, 0)
+            circle(parent, 6, 38, 52, crater, 0)
+            circle(parent, 4, 10, 16, C.white, 0.1)   -- bintang
+            circle(parent, 3, 71, 21, C.white, 0.2)
+            circle(parent, 4, 67, 65, C.white, 0.15)
+        else
+            local sx, sy, rr = 40, 40, 33
+            if kind == "afternoon" then sx, sy, rr = 35, 35, 30 end
+            local ring = circle(parent, 46, sx, sy, accent, 1)
+            new("UIStroke", { Color = accent, Thickness = 2, Transparency = 0.45 }, ring)
+            circle(parent, 30, sx, sy, accent, 0)
+            for i = 0, 7 do
+                local ang = math.rad(i * 45)
+                local ray = new("Frame", {
+                    AnchorPoint = Vector2.new(0.5, 0.5),
+                    Position = UDim2.fromOffset(math.floor(sx + math.cos(ang) * rr + 0.5), math.floor(sy + math.sin(ang) * rr + 0.5)),
+                    Size = UDim2.fromOffset(4, 10), Rotation = i * 45 + 90,
+                    BackgroundColor3 = accent, BorderSizePixel = 0,
+                }, parent)
+                new("UICorner", { CornerRadius = UDim.new(1, 0) }, ray)
+            end
+            if kind == "afternoon" then -- awan kecil di kanan bawah
+                local cl = Color3.fromRGB(240, 245, 255)
+                local base = new("Frame", {
+                    Size = UDim2.fromOffset(44, 18), Position = UDim2.fromOffset(32, 54),
+                    BackgroundColor3 = cl, BorderSizePixel = 0, ZIndex = 2,
+                }, parent)
+                new("UICorner", { CornerRadius = UDim.new(0, 9) }, base)
+                circle(parent, 22, 46, 54, cl, 0).ZIndex = 2
+                circle(parent, 28, 58, 50, cl, 0).ZIndex = 2
+            end
+        end
+    end
+
+    local function textStroke(lbl)
+        new("UIStroke", {
+            Color = Color3.new(0, 0, 0), Thickness = 1.5, Transparency = 0.55,
+            ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual,
+        }, lbl)
+    end
+
+    local HOLD = 2.6 -- detik sign ditahan setelah semua elemen muncul
+
+    playWelcome = function(onDone)
+        welcomeActive = true
+        local greetText, kind, accent = getGreeting()
+
+        local wGui = new("ScreenGui", {
+            Name = "FleetEmpireWelcome", ResetOnSpawn = false, IgnoreGuiInset = true,
+            ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 100,
+        }, nil)
+        wGui.Parent = guiParent()
+
+        for _, o in ipairs(Lighting:GetChildren()) do
+            if o.Name == "FleetEmpireWelcomeBlur" then o:Destroy() end
+        end
+        local blur = new("BlurEffect", { Name = "FleetEmpireWelcomeBlur", Size = 0 }, Lighting)
+
+        env.FleetEmpireWelcomeCleanup = function()
+            welcomeActive = false
+            pcall(function() blur:Destroy() end)
+            pcall(function() wGui:Destroy() end)
+        end
+
+        local sz = wGui.AbsoluteSize
+        if sz.X < 100 or sz.Y < 100 then task.wait(); sz = wGui.AbsoluteSize end
+        if sz.X < 100 or sz.Y < 100 then sz = vp end
+
+        -- posisi kartu dibulatkan ke pixel penuh (posisi pecahan = teks buram)
+        local CW, CH = 560, 316
+        local cx = math.floor((sz.X - CW * fit) / 2)
+        local cy = math.floor((sz.Y - CH * fit) / 2)
+        local basePos = UDim2.fromOffset(cx, cy)
+
+        -- lapisan glass menutup seluruh layar (frosted + gelap agar teks jelas)
+        local frost = new("Frame", {
+            Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(8, 10, 20),
+            BackgroundTransparency = 0.3, BorderSizePixel = 0,
+        }, wGui)
+        new("UIGradient", {
+            Rotation = 125,
+            Color = ColorSequence.new(Color3.fromRGB(30, 38, 74), Color3.fromRGB(6, 8, 16)),
+            Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0.1),
+                NumberSequenceKeypoint.new(1, 0.4),
+            }),
+        }, frost)
+
+        -- kartu glass (gelap pekat -> kontras teks tinggi)
+        local card = new("Frame", {
+            Size = UDim2.fromOffset(CW, CH), Position = basePos + UDim2.fromOffset(0, 30),
+            BackgroundColor3 = Color3.fromRGB(14, 17, 28), BackgroundTransparency = 0.1, BorderSizePixel = 0,
+        }, wGui)
+        new("UICorner", { CornerRadius = UDim.new(0, 28) }, card)
+        new("UIScale", { Scale = fit }, card)
+        local cardStroke = new("UIStroke", { Color = C.white, Thickness = 1.5, Transparency = 0.45 }, card)
+        new("UIGradient", {
+            Rotation = 90,
+            Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0.0),
+                NumberSequenceKeypoint.new(0.5, 0.65),
+                NumberSequenceKeypoint.new(1, 0.85),
+            }),
+        }, cardStroke)
+        local cardSheen = new("Frame", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = C.white, BackgroundTransparency = 0.94, BorderSizePixel = 0 }, card)
+        new("UICorner", { CornerRadius = UDim.new(0, 28) }, cardSheen)
+        new("UIGradient", {
+            Rotation = 110,
+            Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0.0),
+                NumberSequenceKeypoint.new(0.6, 0.8),
+                NumberSequenceKeypoint.new(1, 1),
+            }),
+        }, cardSheen)
+
+        -- isi kartu
+        local iconHolder = new("Frame", { Size = UDim2.fromOffset(80, 80), Position = UDim2.fromOffset(240, 24), BackgroundTransparency = 1 }, card)
+        makeIcon(iconHolder, kind, accent)
+
+        local greet = new("TextLabel", {
+            Size = UDim2.fromOffset(520, 64), Position = UDim2.fromOffset(20, 112), BackgroundTransparency = 1,
+            Text = greetText, TextColor3 = C.white, Font = Enum.Font.GothamBlack, TextSize = 54,
+        }, card)
+        textStroke(greet)
+
+        local nameLbl = new("TextLabel", {
+            Size = UDim2.fromOffset(520, 30), Position = UDim2.fromOffset(20, 178), BackgroundTransparency = 1,
+            Text = lp.DisplayName, TextColor3 = accent, Font = Enum.Font.GothamBold, TextSize = 26,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+        }, card)
+        textStroke(nameLbl)
+
+        local rest = new("Frame", { Size = UDim2.fromOffset(CW, 100), Position = UDim2.fromOffset(0, 216), BackgroundTransparency = 1 }, card)
+        local divider = new("Frame", {
+            Size = UDim2.fromOffset(240, 1), Position = UDim2.fromOffset(160, 6), BackgroundColor3 = C.white,
+            BackgroundTransparency = 0.78, BorderSizePixel = 0,
+        }, rest)
+        new("UIGradient", {
+            Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.5, 0), NumberSequenceKeypoint.new(1, 1),
+            }),
+        }, divider)
+
+        local okT, timeStr = pcall(function()
+            local clock = os.date("%I:%M %p"):gsub("^0", "")
+            return clock .. "  \u{2022}  " .. os.date("%A, %d %B %Y")
+        end)
+        local info = new("TextLabel", {
+            Size = UDim2.fromOffset(520, 24), Position = UDim2.fromOffset(20, 18), BackgroundTransparency = 1,
+            Text = okT and timeStr or "", TextColor3 = Color3.fromRGB(230, 235, 248), Font = Enum.Font.GothamMedium, TextSize = 17,
+        }, rest)
+        textStroke(info)
+
+        new("TextLabel", {
+            Size = UDim2.fromOffset(520, 18), Position = UDim2.fromOffset(20, 48), BackgroundTransparency = 1,
+            Text = "FLEET EMPIRE  \u{2022}  Made by Eggsline", TextColor3 = Color3.fromRGB(190, 198, 218), Font = Enum.Font.GothamMedium, TextSize = 13,
+        }, rest)
+
+        local track_ = new("Frame", {
+            Size = UDim2.fromOffset(200, 4), Position = UDim2.fromOffset(180, 76), BackgroundColor3 = C.white,
+            BackgroundTransparency = 0.86, BorderSizePixel = 0,
+        }, rest)
+        new("UICorner", { CornerRadius = UDim.new(1, 0) }, track_)
+        local fill = new("Frame", { Size = UDim2.fromOffset(0, 4), BackgroundColor3 = accent, BorderSizePixel = 0 }, track_)
+        new("UICorner", { CornerRadius = UDim.new(1, 0) }, fill)
+
+        -- grup fade (muncul bertahap)
+        local fFrost = collect({ frost })
+        local fCard = collect({ card, cardStroke, cardSheen })
+        local fIcon = collect(withDesc(iconHolder))
+        local fGreet = collect(withDesc(greet))
+        local fName = collect(withDesc(nameLbl))
+        local fRest = collect(withDesc(rest))
+        local groups = { fFrost, fCard, fIcon, fGreet, fName, fRest }
+        for _, g in ipairs(groups) do g(0) end
+
+        -- 1) masuk
+        tween(blur, 0.8, { Size = 24 }, Enum.EasingStyle.Quint)
+        animate(fFrost, 0, 1, 0.5)
+        tween(card, 0.75, { Position = basePos }, Enum.EasingStyle.Quint)
+        animate(fCard, 0, 1, 0.5)
+        task.delay(0.30, function() animate(fIcon, 0, 1, 0.45) end)
+        task.delay(0.45, function() animate(fGreet, 0, 1, 0.45) end)
+        task.delay(0.65, function() animate(fName, 0, 1, 0.45) end)
+        task.delay(0.80, function()
+            animate(fRest, 0, 1, 0.45)
+            tween(fill, HOLD, { Size = UDim2.fromOffset(200, 4) }, Enum.EasingStyle.Linear)
+        end)
+        task.wait(0.8 + HOLD + 0.15)
+
+        -- 2) keluar: semuanya fade out di tengah layar, blur hilang, UI menyusul
+        animate(function(a) for _, g in ipairs(groups) do g(a) end end, 1, 0, 0.55, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+        tween(card, 0.55, { Position = basePos - UDim2.fromOffset(0, 14) }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+        tween(blur, 0.6, { Size = 0 }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+        task.wait(0.35)
+        welcomeActive = false
+        if onDone and alive() then onDone() end -- UI mulai fade-in saat sign hampir hilang (crossfade)
+        task.wait(0.4)
+        pcall(function() blur:Destroy() end)
+        pcall(function() wGui:Destroy() end)
+    end
+end
+
 local function cleanup()
     env.FleetEmpireRun = -1
+    if env.FleetEmpireWelcomeCleanup then pcall(env.FleetEmpireWelcomeCleanup); env.FleetEmpireWelcomeCleanup = nil end
     setAntiAfk(false)
     pcall(setHideIdentity, false)
     for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
@@ -1542,7 +1826,7 @@ minBtn.MouseButton1Click:Connect(function()
 end)
 
 track(UIS.InputBegan:Connect(function(i, processed)
-    if processed or i.KeyCode ~= Enum.KeyCode.RightShift or busy then return end
+    if processed or i.KeyCode ~= Enum.KeyCode.RightShift or busy or welcomeActive then return end
     if visible then closeAnim() else openAnim() end
 end))
 
@@ -1568,7 +1852,15 @@ end))
 ------------------------------------------------
 setAntiAfk(cfg.antiAfk)
 if cfg.hideIdentity then setHideIdentity(true) end
-openAnim()
+task.spawn(function()
+    local ok, err = pcall(playWelcome, openAnim)
+    if not ok then
+        warn("[FleetEmpire] welcome sign error: " .. tostring(err))
+        welcomeActive = false
+        pcall(function() if env.FleetEmpireWelcomeCleanup then env.FleetEmpireWelcomeCleanup() end end)
+        if alive() and not visible then openAnim() end
+    end
+end)
 
 if cfg.autoExecute then
     local ok, why = queueReload()
