@@ -1,21 +1,22 @@
 --[[
-    FLEET EMPIRE - AUTO FARM
+    FLEET EMPIRE - AUTO FARM  (v2)
+
     Fitur:
       1. Auto Claim Daily + Playtime
       2. Auto Collect Offline Report
-      3. Auto Dispatch (Driver NPC & Truck sendiri dipisah) - mode: $/mile, Highest payout, Shortest
-      4. Auto Refuel (fuel perusahaan)
+      3. Auto Dispatch (Driver NPC & Truck sendiri dipisah) - mode: $/mile, Payout, Shortest
+      4. Auto Refuel
       5. Auto Repair (Driver NPC / Truck sendiri dipisah)
-      6. Anti AFK
-      7. Panel statistik
+      6. Auto Withdraw bank -> cash selalu >= minimum (default $100.000)
+      7. Auto Execute setelah rejoin / pindah server (update) lewat queue_on_teleport
+      8. Auto Update  : kalau game minta update, otomatis tekan "UPDATE NOW" (RequestUpdate)
+      9. Auto Reconnect: kalau kena disconnect / server shutdown, otomatis rejoin
+     10. Anti AFK + Panel statistik
 
-    Semua aksi memakai remote yang sama dengan UI game:
-      ClaimDaily()                          ClaimPlaytime(index)       CollectOfflineReport()
-      AcceptJob(bizId, loadKey)             -> dispatch truck sendiri
-      ManualDispatch(npcId, bizId, loadKey) -> dispatch driver NPC
-      TravelTo(origin) / ManualReposition(npcId, origin)               -> pindah (deadhead)
-      RefuelCompany(gallons)
-      RepairCompanyVehicleComponent(vehUid, comp) / RoadsideRepair(vehUid)
+    AUTO EXECUTE - script harus bisa dimuat ulang di server baru. Pilih salah satu:
+      a) simpan script ini ke  <workspace>/FleetEmpire/fleet_empire.lua   (disarankan), atau
+      b) set  getgenv().FleetEmpireURL = "https://.../fleet_empire.lua"  sebelum execute, atau
+      c) taruh script di folder autoexec executor (kalau begitu a & b tidak perlu)
 
     Hotkey: RightShift = sembunyikan / tampilkan window
 ]]
@@ -25,6 +26,9 @@ local RS = game:GetService("ReplicatedStorage")
 local UIS = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
 local VirtualUser = game:GetService("VirtualUser")
+local TweenService = game:GetService("TweenService")
+local TeleportService = game:GetService("TeleportService")
+local GuiService = game:GetService("GuiService")
 local CoreGui = game:GetService("CoreGui")
 local lp = Players.LocalPlayer
 
@@ -81,6 +85,8 @@ end
 -- CONFIG (auto simpan kalau executor punya writefile)
 ------------------------------------------------
 local CFG_FILE = "FleetEmpire_AutoFarm.json"
+local SCRIPT_FILE = "FleetEmpire/fleet_empire.lua"
+
 local cfg = {
     claimDaily = false,
     claimPlaytime = false,
@@ -93,12 +99,19 @@ local cfg = {
     reposition = true,
 
     refuel = false,
-    refuelBelow = 40,   -- refuel kalau fuel <= x%
-    refuelTo = 100,     -- isi sampai x%
+    refuelBelow = 40,
+    refuelTo = 100,
 
     repairDriver = false,
     repairSelf = false,
-    repairBelow = 70,   -- repair komponen kalau condition < x%
+    repairBelow = 70,
+
+    autoWithdraw = true,
+    minCash = 100000,
+
+    autoExecute = true,
+    autoUpdate = true,
+    autoReconnect = true,
 
     antiAfk = false,
 }
@@ -136,17 +149,90 @@ local stats = {
     daily = 0,
     playtime = 0,
     offline = 0,
-    lastAction = "-",
+    withdraws = 0,
+    withdrawn = 0,
+    lastAction = "Siap",
 }
 local function note(msg) stats.lastAction = msg end
 
 ------------------------------------------------
+-- AUTO EXECUTE (queue_on_teleport) + REJOIN
+------------------------------------------------
+local queueTeleport = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+local queued = false
+
+local function loaderSource()
+    local url = env.FleetEmpireURL
+    if type(url) == "string" and url ~= "" then
+        return string.format("loadstring(game:HttpGet(%q))()", url)
+    end
+    if isfile and isfile(SCRIPT_FILE) then
+        return string.format("loadstring(readfile(%q))()", SCRIPT_FILE)
+    end
+    return nil
+end
+
+-- return ok, alasan
+local function queueReload()
+    if queued then return true end
+    if not queueTeleport then return false, "executor tidak punya queue_on_teleport" end
+    local src = loaderSource()
+    if not src then
+        return false, "simpan script ke workspace/" .. SCRIPT_FILE .. " atau set getgenv().FleetEmpireURL"
+    end
+    queueTeleport("if not game:IsLoaded() then game.Loaded:Wait() end task.wait(3) " .. src)
+    queued = true
+    return true
+end
+
+local rejoining = false
+local function rejoin(reason)
+    if rejoining then return end
+    rejoining = true
+    note(reason or "Rejoin...")
+    if cfg.autoExecute then queueReload() end
+    pcall(function() TeleportService:Teleport(game.PlaceId, lp) end)
+    task.delay(30, function() rejoining = false end)
+end
+
+local tpTries = 0
+track(TeleportService.TeleportInitFailed:Connect(function(plr)
+    if plr ~= lp or not cfg.autoReconnect or not alive() then return end
+    tpTries += 1
+    if tpTries > 6 then return end
+    note("Teleport gagal, coba lagi (" .. tpTries .. "/6)")
+    task.wait(5)
+    pcall(function() TeleportService:Teleport(game.PlaceId, lp) end)
+end))
+
+-- disconnect / server shutdown -> rejoin
+task.spawn(function()
+    pcall(function()
+        local gui = CoreGui:WaitForChild("RobloxPromptGui", 15)
+        local overlay = gui and gui:WaitForChild("promptOverlay", 15)
+        if overlay then
+            track(overlay.ChildAdded:Connect(function(child)
+                if child.Name == "ErrorPrompt" and cfg.autoReconnect and alive() then
+                    task.wait(2)
+                    rejoin("Disconnect terdeteksi, rejoin...")
+                end
+            end))
+        end
+    end)
+end)
+track(GuiService.ErrorMessageChanged:Connect(function()
+    if cfg.autoReconnect and alive() and GuiService:GetErrorMessage() ~= "" then
+        task.wait(2)
+        rejoin("Disconnect terdeteksi, rejoin...")
+    end
+end))
+
+------------------------------------------------
 -- LOGIKA DISPATCH (meniru board load milik game)
 ------------------------------------------------
-local MODE_ORDER = { "perMile", "payout", "distance" }
-local MODE_LABEL = { perMile = "$ / Mile", payout = "Highest Payout", distance = "Shortest" }
+local MODE_OPTIONS = { { "perMile", "$ / Mile" }, { "payout", "Payout" }, { "distance", "Shortest" } }
 
-local function buildRows(state, capacity, originState, vehTypeId, mileage, fuel)
+local function buildRows(state, capacity, originState, vehTypeId, mileage)
     local rows = {}
     local payMap = (GameConfig.Economy and GameConfig.Economy.StatePayMultiplier) or {}
     for bizId, b in pairs(state.businesses or {}) do
@@ -204,13 +290,14 @@ end
 ------------------------------------------------
 -- AKSI OTOMATIS
 ------------------------------------------------
-local cd = {}                -- cooldown generik
-local pendingDispatch = {}   -- [vehUid] = { t, key }
-local failedLoads = {}       -- [vehUid|biz|key] = expiry
-local lastReposition = {}    -- [vehUid] = expiry
-local repairCd = {}          -- [vehUid] = expiry
+local cd = {}
+local pendingDispatch = {}
+local failedLoads = {}
+local lastReposition = {}
+local repairCd = {}
 local forceRefuel = false
 local offState = { at = nil, t = 0 }
+local wdPending = nil
 
 local function ready(key, secs)
     local now = os.clock()
@@ -221,7 +308,7 @@ end
 
 local function pretty(s) return (tostring(s or ""):gsub("(%l)(%u)", "%1 %2")) end
 
--- 1) claim daily / playtime / offline report
+-- claim daily / playtime / offline report
 local function doClaims(state)
     if cfg.claimDaily and state.daily and state.daily.claimable == true and ready("daily", 10) then
         if fire("ClaimDaily") then
@@ -233,8 +320,7 @@ local function doClaims(state)
     if cfg.claimPlaytime and state.playtime and type(state.playtime.milestones) == "table" then
         for _, m in pairs(state.playtime.milestones) do
             if m.reached and not m.claimed and ready("pt" .. tostring(m.index), 10) then
-                local idx = m.index
-                local label = m.label
+                local idx, label = m.index, m.label
                 task.spawn(function()
                     local ok, res = pcall(function() return Remotes.ClaimPlaytime:InvokeServer(idx) end)
                     if ok and type(res) == "table" and res.ok then
@@ -264,16 +350,60 @@ local function doClaims(state)
     end
 end
 
--- 2) refuel (fuel perusahaan dipakai semua truck)
+-- auto withdraw: cash < minCash -> ambil dari bank sebesar kekurangannya
+local function doBank(state)
+    if not cfg.autoWithdraw then return end
+    local c = state.company
+    local cash = c.cash or 0
+    if cash >= cfg.minCash then
+        wdPending = nil
+        return
+    end
+    local balance = math.floor((c.bank and c.bank.balance) or 0)
+    if balance <= 0 then return end
+
+    -- tunggu state ter-update setelah withdraw sebelumnya (hindari withdraw ganda)
+    if wdPending and os.clock() - wdPending.t < 6 and cash <= wdPending.cash then return end
+    if not ready("withdraw", 2) then return end
+
+    local amount = math.floor(math.min(cfg.minCash - cash, balance))
+    if amount <= 0 then return end
+    if fire("WithdrawFromBank", amount) then
+        wdPending = { t = os.clock(), cash = cash }
+        stats.withdraws += 1
+        stats.withdrawn += amount
+        note(string.format("Withdraw $%d dari bank", amount))
+    end
+end
+
+-- auto update: game minta pindah server -> tekan "UPDATE NOW" (RequestUpdate)
+local function doUpdate(state)
+    if not cfg.autoUpdate then return end
+    local u = state.update
+    if not (type(u) == "table" and u.available == true) then return end
+    if not ready("update", 30) then return end
+
+    if cfg.autoExecute then
+        local ok, why = queueReload()
+        if not ok then
+            note("Update ditunda: " .. tostring(why))
+            return
+        end
+    end
+    if fire("RequestUpdate") then
+        note("Update tersedia -> pindah server...")
+    end
+end
+
+-- refuel
 local function doRefuel(state)
     if not cfg.refuel then return end
     local c = state.company
     local cap = c.fuelCapacity or 0
     local fuel = c.fuel or 0
     if cap <= 0 then return end
-    local pct = fuel / cap * 100
     local forced = forceRefuel
-    if not forced and pct > cfg.refuelBelow then return end
+    if not forced and fuel / cap * 100 > cfg.refuelBelow then return end
     if not ready("refuel", 4) then return end
 
     local targetPct = forced and 100 or cfg.refuelTo
@@ -293,7 +423,7 @@ local function doRefuel(state)
     end
 end
 
--- 3) repair
+-- repair
 local COMPONENTS = { "engine", "tires", "brakes", "transmission" }
 local function repairDiscount(company)
     local m = company.upgrades and company.upgrades.maintenance
@@ -303,7 +433,6 @@ local function repairDiscount(company)
     return 1
 end
 
--- return true kalau ada repair yang dikirim
 local function doRepair(state, uid, veh)
     if os.clock() < (repairCd[uid] or 0) then return true end
     local company = state.company
@@ -341,7 +470,7 @@ local function doRepair(state, uid, veh)
     return fired
 end
 
--- 4) dispatch satu kendaraan (kind = "driver" | "self")
+-- dispatch satu kendaraan (kind = "driver" | "self")
 local function doDispatch(state, uid, veh, kind, npc)
     local now = os.clock()
     local mode = (kind == "driver") and cfg.modeDriver or cfg.modeSelf
@@ -349,17 +478,16 @@ local function doDispatch(state, uid, veh, kind, npc)
     local p = pendingDispatch[uid]
     if p then
         if now - p.t < 4 then return end
-        failedLoads[uid .. "|" .. p.key] = now + 90 -- masih Idle = ditolak server
+        failedLoads[uid .. "|" .. p.key] = now + 90
         pendingDispatch[uid] = nil
     end
 
     local def = Vehicles[veh.id]
     local capacity = def and def.capacity or 0
     if capacity <= 0 then return end
-    local company = state.company
-    local fuel = company.fuel or 0
+    local fuel = state.company.fuel or 0
 
-    local rows = buildRows(state, capacity, veh.location, veh.id, veh.mileage, nil)
+    local rows = buildRows(state, capacity, veh.location, veh.id, veh.mileage)
     local usable, blockedByFuel = {}, false
     for _, r in ipairs(rows) do
         if (failedLoads[uid .. "|" .. r.bizId .. "|" .. tostring(r.loadKey)] or 0) <= now then
@@ -383,7 +511,7 @@ local function doDispatch(state, uid, veh, kind, npc)
         if ok then
             pendingDispatch[uid] = { t = now, key = r.bizId .. "|" .. tostring(r.loadKey) }
             if kind == "driver" then stats.dispatchDriver += 1 else stats.dispatchSelf += 1 end
-            note(string.format("%s: %s %s -> %s  %d mi  $%d",
+            note(string.format("%s: %s %s > %s  %d mi  $%d",
                 kind == "driver" and (npc.name or "Driver") or "Truck sendiri",
                 tostring(r.cargo), pretty(r.origin), pretty(r.destination), r.distance, r.payout))
         end
@@ -391,13 +519,12 @@ local function doDispatch(state, uid, veh, kind, npc)
     end
 
     if blockedByFuel then
-        if cfg.refuel then forceRefuel = true end -- ada load tapi fuel kurang -> isi sampai penuh
+        if cfg.refuel then forceRefuel = true end
         return
     end
 
-    -- tidak ada load di state ini -> pindahkan (deadhead) ke state yang punya load
     if cfg.reposition and now > (lastReposition[uid] or 0) then
-        local all = buildRows(state, capacity, nil, veh.id, veh.mileage, nil)
+        local all = buildRows(state, capacity, nil, veh.id, veh.mileage)
         local far = {}
         for _, r in ipairs(all) do
             if r.origin ~= veh.location then far[#far + 1] = r end
@@ -428,8 +555,7 @@ local function processVehicle(state, uid, veh, kind, npc)
     if veh.status ~= "Idle" then pendingDispatch[uid] = nil end
 
     if repairOn then
-        local busy = doRepair(state, uid, veh)
-        if busy then return end -- tunggu state ter-update sebelum dispatch
+        if doRepair(state, uid, veh) then return end
     end
     if dispatchOn and veh.status == "Idle" then
         doDispatch(state, uid, veh, kind, npc)
@@ -445,15 +571,15 @@ local function runTick(state)
         stats.startDeliveries = state.stats and state.stats.deliveries or 0
     end
 
+    doUpdate(state)
     doClaims(state)
+    doBank(state)      -- cash dulu, baru belanja (refuel / repair)
     doRefuel(state)
 
     local vehicles = company.vehicles or {}
-
     if company.myVehicleUid and vehicles[company.myVehicleUid] then
         processVehicle(state, company.myVehicleUid, vehicles[company.myVehicleUid], "self", nil)
     end
-
     for _, npc in pairs(company.npcs or {}) do
         local uid = npc.assignedVehicleUid
         if uid and vehicles[uid] then
@@ -481,13 +607,19 @@ local function setAntiAfk(on)
 end
 
 ------------------------------------------------
--- GUI
+-- GUI  (iOS glass panel)
 ------------------------------------------------
 local function new(class, props, parent)
     local i = Instance.new(class)
     for k, v in pairs(props or {}) do i[k] = v end
     if parent then i.Parent = parent end
     return i
+end
+
+local function tween(inst, t, props, style, dir)
+    local tw = TweenService:Create(inst, TweenInfo.new(t, style or Enum.EasingStyle.Quint, dir or Enum.EasingDirection.Out), props)
+    tw:Play()
+    return tw
 end
 
 local function guiParent()
@@ -499,237 +631,360 @@ local function guiParent()
 end
 
 local C = {
-    bg = Color3.fromRGB(22, 24, 30),
-    panel = Color3.fromRGB(32, 35, 44),
-    title = Color3.fromRGB(40, 44, 56),
-    text = Color3.fromRGB(225, 228, 235),
-    muted = Color3.fromRGB(140, 146, 160),
-    on = Color3.fromRGB(40, 160, 80),
-    off = Color3.fromRGB(70, 74, 86),
-    accent = Color3.fromRGB(240, 170, 40),
+    glass = Color3.fromRGB(18, 20, 30),
+    white = Color3.new(1, 1, 1),
+    sub = Color3.fromRGB(176, 182, 200),
+    green = Color3.fromRGB(52, 199, 89),
+    blue = Color3.fromRGB(10, 132, 255),
+    red = Color3.fromRGB(255, 69, 58),
+    yellow = Color3.fromRGB(255, 189, 46),
+    off = Color3.fromRGB(88, 92, 104),
 }
 
-local gui = new("ScreenGui", { Name = "FleetEmpireFarm", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling }, nil)
+local W, H, HEADER, FOOTER = 360, 540, 58, 30
+
+local gui = new("ScreenGui", { Name = "FleetEmpireFarm", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 50 }, nil)
 gui.Parent = guiParent()
 
-local main = new("Frame", {
-    Size = UDim2.fromOffset(340, 460),
-    Position = UDim2.new(0, 24, 0.5, -230),
-    BackgroundColor3 = C.bg,
+local main = new("CanvasGroup", {
+    Name = "Glass",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Size = UDim2.fromOffset(W, H),
+    Position = UDim2.new(0, 24 + W / 2, 0.5, 0),
+    BackgroundColor3 = C.glass,
+    BackgroundTransparency = 0.18,
+    GroupTransparency = 1,
     BorderSizePixel = 0,
 }, gui)
-new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
-new("UIStroke", { Color = C.accent, Thickness = 1, Transparency = 0.5 }, main)
+new("UICorner", { CornerRadius = UDim.new(0, 22) }, main)
+local scale = new("UIScale", { Scale = 0.88 }, main)
 
-local titleBar = new("Frame", { Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = C.title, BorderSizePixel = 0 }, main)
-new("UICorner", { CornerRadius = UDim.new(0, 10) }, titleBar)
+-- kilau kaca (sheen)
+local sheen = new("Frame", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = C.white, BorderSizePixel = 0 }, main)
+new("UICorner", { CornerRadius = UDim.new(0, 22) }, sheen)
+new("UIGradient", {
+    Rotation = 115,
+    Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.84),
+        NumberSequenceKeypoint.new(0.4, 0.95),
+        NumberSequenceKeypoint.new(1, 0.99),
+    }),
+}, sheen)
+
+-- tepi kaca
+local border = new("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1 }, main)
+new("UICorner", { CornerRadius = UDim.new(0, 22) }, border)
+local borderStroke = new("UIStroke", { Color = C.white, Thickness = 1.2, Transparency = 0.55, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, border)
+new("UIGradient", {
+    Rotation = 90,
+    Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.1),
+        NumberSequenceKeypoint.new(0.5, 0.75),
+        NumberSequenceKeypoint.new(1, 0.9),
+    }),
+}, borderStroke)
+
+-- ===== HEADER: avatar + nama Roblox (pojok kiri atas) =====
+local header = new("Frame", { Size = UDim2.new(1, 0, 0, HEADER), BackgroundTransparency = 1 }, main)
+
+local avatarRing = new("Frame", {
+    Size = UDim2.fromOffset(38, 38), Position = UDim2.fromOffset(16, 10), BackgroundColor3 = C.white, BackgroundTransparency = 0.82,
+}, header)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, avatarRing)
+new("UIStroke", { Color = C.white, Thickness = 1, Transparency = 0.6 }, avatarRing)
+local avatar = new("ImageLabel", {
+    Size = UDim2.new(1, -4, 1, -4), Position = UDim2.fromOffset(2, 2), BackgroundTransparency = 1, Image = "",
+}, avatarRing)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, avatar)
+
+task.spawn(function()
+    local ok, img = pcall(function()
+        return Players:GetUserThumbnailAsync(lp.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
+    end)
+    if ok and img and avatar.Parent then avatar.Image = img end
+end)
+
 new("TextLabel", {
-    Size = UDim2.new(1, -80, 1, 0), Position = UDim2.fromOffset(12, 0), BackgroundTransparency = 1,
-    Text = "Fleet Empire  •  Auto Farm", TextColor3 = C.accent, Font = Enum.Font.GothamBold, TextSize = 14,
-    TextXAlignment = Enum.TextXAlignment.Left,
-}, titleBar)
+    Size = UDim2.new(1, -150, 0, 20), Position = UDim2.fromOffset(62, 11), BackgroundTransparency = 1,
+    Text = lp.DisplayName, TextColor3 = C.white, Font = Enum.Font.GothamBold, TextSize = 15,
+    TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+}, header)
+new("TextLabel", {
+    Size = UDim2.new(1, -150, 0, 14), Position = UDim2.fromOffset(62, 31), BackgroundTransparency = 1,
+    Text = "@" .. lp.Name .. "  •  Fleet Empire", TextColor3 = C.sub, Font = Enum.Font.Gotham, TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+}, header)
 
-local minBtn = new("TextButton", {
-    Size = UDim2.fromOffset(26, 22), Position = UDim2.new(1, -62, 0, 5), BackgroundColor3 = C.off,
-    Text = "–", TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 14, BorderSizePixel = 0,
-}, titleBar)
-new("UICorner", { CornerRadius = UDim.new(0, 6) }, minBtn)
-local closeBtn = new("TextButton", {
-    Size = UDim2.fromOffset(26, 22), Position = UDim2.new(1, -32, 0, 5), BackgroundColor3 = Color3.fromRGB(170, 55, 55),
-    Text = "X", TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 12, BorderSizePixel = 0,
-}, titleBar)
-new("UICorner", { CornerRadius = UDim.new(0, 6) }, closeBtn)
+local function windowDot(color, xFromRight)
+    local b = new("TextButton", {
+        Size = UDim2.fromOffset(16, 16), AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, xFromRight, 0, 21),
+        BackgroundColor3 = color, Text = "", AutoButtonColor = false,
+    }, header)
+    new("UICorner", { CornerRadius = UDim.new(1, 0) }, b)
+    b.MouseEnter:Connect(function() tween(b, 0.15, { Size = UDim2.fromOffset(19, 19) }) end)
+    b.MouseLeave:Connect(function() tween(b, 0.15, { Size = UDim2.fromOffset(16, 16) }) end)
+    return b
+end
+local closeBtn = windowDot(C.red, -16)
+local minBtn = windowDot(C.yellow, -40)
 
--- drag
-local dragging, dragStart, startPos
-track(titleBar.InputBegan:Connect(function(i)
-    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-        dragging, dragStart, startPos = true, i.Position, main.Position
-        i.Changed:Connect(function()
-            if i.UserInputState == Enum.UserInputState.End then dragging = false end
+-- ===== helper komponen =====
+local function makeSegmented(parent, opts, getFn, setFn, props)
+    local track_ = new("Frame", { BackgroundColor3 = C.white, BackgroundTransparency = 0.88, BorderSizePixel = 0 }, parent)
+    for k, v in pairs(props) do track_[k] = v end
+    new("UICorner", { CornerRadius = UDim.new(0, 10) }, track_)
+    local n = #opts
+    local hi = new("Frame", { Size = UDim2.new(1 / n, -4, 1, -4), BackgroundColor3 = C.blue, BorderSizePixel = 0 }, track_)
+    new("UICorner", { CornerRadius = UDim.new(0, 8) }, hi)
+    local buttons = {}
+    local function idxOf(v)
+        for i, o in ipairs(opts) do if o[1] == v then return i end end
+        return 1
+    end
+    local function refresh(animate)
+        local i = idxOf(getFn())
+        local pos = UDim2.new((i - 1) / n, 2, 0, 2)
+        if animate then tween(hi, 0.3, { Position = pos }) else hi.Position = pos end
+        for j, b in ipairs(buttons) do
+            tween(b, 0.2, { TextColor3 = (j == i) and C.white or C.sub })
+        end
+    end
+    for i, o in ipairs(opts) do
+        local b = new("TextButton", {
+            Size = UDim2.new(1 / n, 0, 1, 0), Position = UDim2.new((i - 1) / n, 0, 0, 0), BackgroundTransparency = 1,
+            Text = o[2], Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = C.sub, AutoButtonColor = false,
+        }, track_)
+        buttons[i] = b
+        b.MouseButton1Click:Connect(function()
+            setFn(o[1])
+            refresh(true)
         end)
     end
-end))
-track(UIS.InputChanged:Connect(function(i)
-    if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
-        local d = i.Position - dragStart
-        main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    refresh(false)
+    return track_
+end
+
+local function makeSwitch(parent, getFn, setFn)
+    local trackBtn = new("TextButton", {
+        Size = UDim2.fromOffset(48, 28), AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -14, 0.5, 0),
+        Text = "", AutoButtonColor = false, BackgroundColor3 = C.off,
+    }, parent)
+    new("UICorner", { CornerRadius = UDim.new(1, 0) }, trackBtn)
+    local knob = new("Frame", { Size = UDim2.fromOffset(24, 24), Position = UDim2.fromOffset(2, 2), BackgroundColor3 = C.white }, trackBtn)
+    new("UICorner", { CornerRadius = UDim.new(1, 0) }, knob)
+    local function apply(animate)
+        local on = getFn()
+        local col = on and C.green or C.off
+        local pos = on and UDim2.fromOffset(22, 2) or UDim2.fromOffset(2, 2)
+        if animate then
+            tween(trackBtn, 0.25, { BackgroundColor3 = col })
+            tween(knob, 0.28, { Position = pos }, Enum.EasingStyle.Back)
+            tween(knob, 0.12, { Size = UDim2.fromOffset(28, 24) }).Completed:Connect(function()
+                tween(knob, 0.16, { Size = UDim2.fromOffset(24, 24) })
+            end)
+        else
+            trackBtn.BackgroundColor3 = col
+            knob.Position = pos
+        end
     end
-end))
+    apply(false)
+    trackBtn.MouseButton1Click:Connect(function()
+        setFn(not getFn())
+        apply(true)
+    end)
+end
 
--- tabs
-local tabBar = new("Frame", { Size = UDim2.new(1, -16, 0, 26), Position = UDim2.fromOffset(8, 38), BackgroundTransparency = 1 }, main)
-new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6) }, tabBar)
+local function makeStepper(parent, getFn, setFn, minv, maxv, step, fmtFn)
+    local box = new("Frame", {
+        Size = UDim2.fromOffset(132, 28), AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -14, 0.5, 0),
+        BackgroundColor3 = C.white, BackgroundTransparency = 0.88,
+    }, parent)
+    new("UICorner", { CornerRadius = UDim.new(0, 9) }, box)
+    local val = new("TextLabel", {
+        Size = UDim2.new(1, -60, 1, 0), Position = UDim2.fromOffset(30, 0), BackgroundTransparency = 1,
+        TextColor3 = C.white, Font = Enum.Font.GothamBold, TextSize = 12,
+    }, box)
+    local function refresh() val.Text = fmtFn(getFn()) end
+    refresh()
+    local function btn(txt, x)
+        local b = new("TextButton", {
+            Size = UDim2.fromOffset(30, 28), Position = x, BackgroundTransparency = 1, Text = txt,
+            TextColor3 = C.blue, Font = Enum.Font.GothamBold, TextSize = 18, AutoButtonColor = false,
+        }, box)
+        b.MouseButton1Down:Connect(function() tween(b, 0.1, { TextSize = 13 }) end)
+        b.MouseButton1Up:Connect(function() tween(b, 0.2, { TextSize = 18 }, Enum.EasingStyle.Back) end)
+        b.MouseLeave:Connect(function() tween(b, 0.2, { TextSize = 18 }) end)
+        return b
+    end
+    local minus, plus = btn("−", UDim2.fromOffset(0, 0)), btn("+", UDim2.new(1, -30, 0, 0))
+    minus.MouseButton1Click:Connect(function() setFn(math.max(minv, getFn() - step)) refresh() end)
+    plus.MouseButton1Click:Connect(function() setFn(math.min(maxv, getFn() + step)) refresh() end)
+end
 
+-- ===== halaman =====
+local PAGE_Y = HEADER + 44
 local function makePage()
     local f = new("ScrollingFrame", {
-        Size = UDim2.new(1, -16, 1, -76), Position = UDim2.fromOffset(8, 68), BackgroundTransparency = 1,
-        BorderSizePixel = 0, ScrollBarThickness = 3, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        Size = UDim2.new(1, -28, 1, -(PAGE_Y + FOOTER + 6)), Position = UDim2.fromOffset(14, PAGE_Y), BackgroundTransparency = 1,
+        BorderSizePixel = 0, ScrollBarThickness = 2, ScrollBarImageColor3 = C.sub, CanvasSize = UDim2.new(),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
     }, main)
-    new("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, f)
+    new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, f)
+    new("UIPadding", { PaddingBottom = UDim.new(0, 10), PaddingRight = UDim.new(0, 4) }, f)
+    f:SetAttribute("n", 0)
     return f
 end
 
 local pageFarm, pageStats = makePage(), makePage()
 pageStats.Visible = false
-local tabButtons = {}
-local activePage = pageFarm
+local pages = { farm = pageFarm, stats = pageStats }
+local activeKey = "farm"
 
-local function makeTab(label, page)
-    local b = new("TextButton", {
-        Size = UDim2.fromOffset(100, 26), BackgroundColor3 = C.off, Text = label, TextColor3 = C.text,
-        Font = Enum.Font.GothamBold, TextSize = 12, BorderSizePixel = 0,
-    }, tabBar)
-    new("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
-    tabButtons[#tabButtons + 1] = { b = b, page = page }
-    b.MouseButton1Click:Connect(function()
-        activePage = page
-        for _, t in ipairs(tabButtons) do
-            t.page.Visible = (t.page == page)
-            t.b.BackgroundColor3 = (t.page == page) and C.accent or C.off
-            t.b.TextColor3 = (t.page == page) and Color3.fromRGB(20, 20, 20) or C.text
+local function showPage(key)
+    activeKey = key
+    for k, p in pairs(pages) do
+        if k == key then
+            p.Visible = true
+            p.Position = UDim2.fromOffset(34, PAGE_Y)
+            tween(p, 0.35, { Position = UDim2.fromOffset(14, PAGE_Y) })
+        else
+            p.Visible = false
         end
-    end)
-    return b
+    end
 end
-local tabFarm = makeTab("Farm", pageFarm)
-makeTab("Statistik", pageStats)
-tabFarm.BackgroundColor3 = C.accent
-tabFarm.TextColor3 = Color3.fromRGB(20, 20, 20)
 
-local order = 0
-local function nextOrder() order += 1 return order end
+local tabControl = makeSegmented(main, { { "farm", "Farm" }, { "stats", "Statistik" } }, function() return activeKey end, showPage, {
+    Size = UDim2.new(1, -28, 0, 30), Position = UDim2.fromOffset(14, HEADER + 4),
+})
 
-local function header(parent, text)
+local function nextOrder(page)
+    local n = (page:GetAttribute("n") or 0) + 1
+    page:SetAttribute("n", n)
+    return n
+end
+
+local function section(page, title)
     new("TextLabel", {
-        Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1, Text = text, TextColor3 = C.accent,
-        Font = Enum.Font.GothamBold, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = nextOrder(),
-    }, parent)
+        Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1, Text = string.upper(title), TextColor3 = C.sub,
+        Font = Enum.Font.GothamMedium, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = nextOrder(page),
+    }, page)
+    local card = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = C.white,
+        BackgroundTransparency = 0.91, LayoutOrder = nextOrder(page), BorderSizePixel = 0,
+    }, page)
+    new("UICorner", { CornerRadius = UDim.new(0, 14) }, card)
+    new("UIStroke", { Color = C.white, Thickness = 1, Transparency = 0.86 }, card)
+    new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, card)
+    card:SetAttribute("n", 0)
+    return card
 end
 
-local function row(parent)
-    local r = new("Frame", { Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = C.panel, BorderSizePixel = 0, LayoutOrder = nextOrder() }, parent)
-    new("UICorner", { CornerRadius = UDim.new(0, 6) }, r)
+local function newRow(card, label, height)
+    local n = nextOrder(card)
+    local r = new("Frame", { Size = UDim2.new(1, 0, 0, height or 42), BackgroundTransparency = 1, LayoutOrder = n }, card)
+    if n > 1 then
+        new("Frame", {
+            Size = UDim2.new(1, -28, 0, 1), Position = UDim2.fromOffset(14, 0), BackgroundColor3 = C.white,
+            BackgroundTransparency = 0.88, BorderSizePixel = 0,
+        }, r)
+    end
+    new("TextLabel", {
+        Size = UDim2.new(0.5, -14, 1, 0), Position = UDim2.fromOffset(14, 0), BackgroundTransparency = 1, Text = label,
+        TextColor3 = C.white, Font = Enum.Font.GothamMedium, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, r)
     return r
 end
 
-local function rowLabel(r, text)
-    return new("TextLabel", {
-        Size = UDim2.new(0.58, 0, 1, 0), Position = UDim2.fromOffset(8, 0), BackgroundTransparency = 1, Text = text,
-        TextColor3 = C.text, Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
-    }, r)
-end
-
-local function makeToggle(parent, label, key, hook)
-    local r = row(parent)
-    rowLabel(r, label)
-    local b = new("TextButton", {
-        Size = UDim2.fromOffset(54, 20), Position = UDim2.new(1, -60, 0.5, -10), BorderSizePixel = 0,
-        Font = Enum.Font.GothamBold, TextSize = 11,
-    }, r)
-    new("UICorner", { CornerRadius = UDim.new(0, 5) }, b)
-    local function refresh()
-        b.Text = cfg[key] and "ON" or "OFF"
-        b.BackgroundColor3 = cfg[key] and C.on or C.off
-        b.TextColor3 = cfg[key] and Color3.new(1, 1, 1) or C.muted
-    end
-    refresh()
-    b.MouseButton1Click:Connect(function()
-        cfg[key] = not cfg[key]
-        refresh()
+local function toggleRow(card, label, key, hook)
+    local r = newRow(card, label)
+    makeSwitch(r, function() return cfg[key] end, function(v)
+        cfg[key] = v
         saveCfg()
-        if hook then hook(cfg[key]) end
+        if hook then hook(v) end
     end)
 end
 
-local function makeCycle(parent, label, key, order_, labels)
-    local r = row(parent)
-    rowLabel(r, label)
-    local b = new("TextButton", {
-        Size = UDim2.fromOffset(112, 20), Position = UDim2.new(1, -118, 0.5, -10), BorderSizePixel = 0,
-        BackgroundColor3 = C.off, TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 11,
-    }, r)
-    new("UICorner", { CornerRadius = UDim.new(0, 5) }, b)
-    local function refresh() b.Text = labels[cfg[key]] or tostring(cfg[key]) end
-    refresh()
-    b.MouseButton1Click:Connect(function()
-        local idx = table.find(order_, cfg[key]) or 0
-        cfg[key] = order_[(idx % #order_) + 1]
-        refresh()
-        saveCfg()
-    end)
+local function modeRow(card, label, key)
+    local r = newRow(card, label)
+    makeSegmented(r, MODE_OPTIONS, function() return cfg[key] end, function(v) cfg[key] = v saveCfg() end, {
+        Size = UDim2.fromOffset(176, 28), AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -14, 0.5, 0),
+    })
 end
 
-local function makeStepper(parent, label, key, minv, maxv, step)
-    local r = row(parent)
-    rowLabel(r, label)
-    local function btn(txt, x)
-        local b = new("TextButton", {
-            Size = UDim2.fromOffset(22, 20), Position = UDim2.new(1, x, 0.5, -10), BackgroundColor3 = C.off, BorderSizePixel = 0,
-            Text = txt, TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 13,
-        }, r)
-        new("UICorner", { CornerRadius = UDim.new(0, 5) }, b)
-        return b
-    end
-    local minus, plus = btn("-", -92), btn("+", -28)
-    local val = new("TextLabel", {
-        Size = UDim2.fromOffset(40, 20), Position = UDim2.new(1, -68, 0.5, -10), BackgroundTransparency = 1,
-        TextColor3 = C.accent, Font = Enum.Font.GothamBold, TextSize = 12,
-    }, r)
-    local function refresh() val.Text = tostring(cfg[key]) .. "%" end
-    refresh()
-    minus.MouseButton1Click:Connect(function() cfg[key] = math.max(minv, cfg[key] - step) refresh() saveCfg() end)
-    plus.MouseButton1Click:Connect(function() cfg[key] = math.min(maxv, cfg[key] + step) refresh() saveCfg() end)
+local function stepperRow(card, label, key, minv, maxv, step, fmtFn)
+    local r = newRow(card, label)
+    makeStepper(r, function() return cfg[key] end, function(v) cfg[key] = v saveCfg() end, minv, maxv, step, fmtFn)
+end
+
+local pct = function(v) return tostring(v) .. "%" end
+local function shortMoney(v)
+    if v >= 1000000 then return string.format("$%.1fM", v / 1000000) end
+    return string.format("$%dk", math.floor(v / 1000))
 end
 
 -- ===== TAB FARM =====
-header(pageFarm, "AUTO CLAIM")
-makeToggle(pageFarm, "Claim Daily Reward", "claimDaily")
-makeToggle(pageFarm, "Claim Playtime Reward", "claimPlaytime")
-makeToggle(pageFarm, "Collect Offline Report", "offlineReport")
+local s1 = section(pageFarm, "Auto Claim")
+toggleRow(s1, "Daily Reward", "claimDaily")
+toggleRow(s1, "Playtime Reward", "claimPlaytime")
+toggleRow(s1, "Offline Report", "offlineReport")
 
-header(pageFarm, "AUTO DISPATCH - DRIVER NPC")
-makeToggle(pageFarm, "Dispatch Driver", "dispatchDriver")
-makeCycle(pageFarm, "Mode Driver", "modeDriver", MODE_ORDER, MODE_LABEL)
+local s2 = section(pageFarm, "Dispatch • Driver NPC")
+toggleRow(s2, "Auto Dispatch", "dispatchDriver")
+modeRow(s2, "Prioritas load", "modeDriver")
 
-header(pageFarm, "AUTO DISPATCH - TRUCK SENDIRI")
-makeToggle(pageFarm, "Dispatch Truck Sendiri", "dispatchSelf")
-makeCycle(pageFarm, "Mode Truck Sendiri", "modeSelf", MODE_ORDER, MODE_LABEL)
-makeToggle(pageFarm, "Pindah kalau tak ada load", "reposition")
+local s3 = section(pageFarm, "Dispatch • Truck Sendiri")
+toggleRow(s3, "Auto Dispatch", "dispatchSelf")
+modeRow(s3, "Prioritas load", "modeSelf")
+toggleRow(s3, "Pindah jika tak ada load", "reposition")
 
-header(pageFarm, "AUTO REFUEL")
-makeToggle(pageFarm, "Auto Refuel", "refuel")
-makeStepper(pageFarm, "Refuel jika fuel <=", "refuelBelow", 5, 95, 5)
-makeStepper(pageFarm, "Isi sampai", "refuelTo", 20, 100, 5)
+local s4 = section(pageFarm, "Bank")
+toggleRow(s4, "Auto Withdraw", "autoWithdraw")
+stepperRow(s4, "Cash minimum", "minCash", 10000, 1000000, 10000, shortMoney)
 
-header(pageFarm, "AUTO REPAIR")
-makeToggle(pageFarm, "Repair Driver NPC", "repairDriver")
-makeToggle(pageFarm, "Repair Truck Sendiri", "repairSelf")
-makeStepper(pageFarm, "Repair jika kondisi <", "repairBelow", 10, 99, 5)
+local s5 = section(pageFarm, "Refuel")
+toggleRow(s5, "Auto Refuel", "refuel")
+stepperRow(s5, "Refuel jika fuel ≤", "refuelBelow", 5, 95, 5, pct)
+stepperRow(s5, "Isi sampai", "refuelTo", 20, 100, 5, pct)
 
-header(pageFarm, "UTILITAS")
-makeToggle(pageFarm, "Anti AFK", "antiAfk", setAntiAfk)
+local s6 = section(pageFarm, "Repair")
+toggleRow(s6, "Driver NPC", "repairDriver")
+toggleRow(s6, "Truck Sendiri", "repairSelf")
+stepperRow(s6, "Repair jika kondisi <", "repairBelow", 10, 99, 5, pct)
+
+local s7 = section(pageFarm, "Rejoin & Update")
+toggleRow(s7, "Auto Execute setelah rejoin", "autoExecute", function(on)
+    if on then
+        local ok, why = queueReload()
+        note(ok and "Auto Execute siap" or ("Auto Execute: " .. tostring(why)))
+    end
+end)
+toggleRow(s7, "Auto Update (server minta)", "autoUpdate")
+toggleRow(s7, "Auto Reconnect", "autoReconnect")
+
+local s8 = section(pageFarm, "Utilitas")
+toggleRow(s8, "Anti AFK", "antiAfk", setAntiAfk)
 
 -- ===== TAB STATISTIK =====
 local statLabels = {}
-local function statRow(name)
-    local r = row(pageStats)
-    rowLabel(r, name).Size = UDim2.new(0.34, 0, 1, 0)
+local function statRow(card, name)
+    local r = newRow(card, name, 34)
     local v = new("TextLabel", {
-        Size = UDim2.new(0.64, -12, 1, 0), Position = UDim2.new(0.34, 4, 0, 0), BackgroundTransparency = 1, Text = "-",
-        TextColor3 = C.accent, Font = Enum.Font.GothamBold, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Right,
+        Size = UDim2.new(0.62, -14, 1, 0), Position = UDim2.new(0.38, 0, 0, 0), BackgroundTransparency = 1, Text = "-",
+        TextColor3 = C.white, Font = Enum.Font.GothamBold, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Right,
         TextTruncate = Enum.TextTruncate.AtEnd,
     }, r)
     statLabels[name] = v
-    return v
 end
 
-header(pageStats, "SESI INI")
-for _, n in ipairs({ "Waktu jalan", "Cash", "Cash sesi", "Cash / jam", "Delivery sesi", "Delivery / jam" }) do statRow(n) end
-header(pageStats, "ARMADA")
-for _, n in ipairs({ "Fuel", "Truck", "Dispatch", "Refuel", "Repair", "Claim" }) do statRow(n) end
-header(pageStats, "AKSI TERAKHIR")
-statRow("Aksi")
+local st1 = section(pageStats, "Sesi ini")
+for _, n in ipairs({ "Waktu jalan", "Cash", "Cash sesi", "Cash / jam", "Delivery sesi", "Delivery / jam" }) do statRow(st1, n) end
+local st2 = section(pageStats, "Armada")
+for _, n in ipairs({ "Fuel", "Truck", "Dispatch" }) do statRow(st2, n) end
+local st3 = section(pageStats, "Keuangan")
+for _, n in ipairs({ "Bank", "Withdraw", "Refuel", "Repair", "Claim" }) do statRow(st3, n) end
+local st4 = section(pageStats, "Aksi terakhir")
+statRow(st4, "Aksi")
 
 local function fmt(n)
     n = math.floor((tonumber(n) or 0) + 0.5)
@@ -744,7 +999,27 @@ local function fmtTime(sec)
     return string.format("%02d:%02d:%02d", sec // 3600, (sec % 3600) // 60, sec % 60)
 end
 
+-- ===== FOOTER =====
+local footer = new("Frame", { Size = UDim2.new(1, 0, 0, FOOTER), Position = UDim2.new(0, 0, 1, -FOOTER), BackgroundTransparency = 1 }, main)
+new("Frame", { Size = UDim2.new(1, -28, 0, 1), Position = UDim2.fromOffset(14, 0), BackgroundColor3 = C.white, BackgroundTransparency = 0.9, BorderSizePixel = 0 }, footer)
+local dot = new("Frame", { Size = UDim2.fromOffset(8, 8), Position = UDim2.fromOffset(16, 11), BackgroundColor3 = C.green }, footer)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, dot)
+local footerText = new("TextLabel", {
+    Size = UDim2.new(1, -44, 1, -2), Position = UDim2.fromOffset(32, 2), BackgroundTransparency = 1, Text = stats.lastAction,
+    TextColor3 = C.sub, Font = Enum.Font.Gotham, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+}, footer)
+task.spawn(function() -- dot berdenyut
+    while alive() do
+        tween(dot, 0.9, { BackgroundTransparency = 0.6 }, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+        task.wait(0.9)
+        tween(dot, 0.9, { BackgroundTransparency = 0 }, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+        task.wait(0.9)
+    end
+end)
+
 local function refreshStats(state)
+    footerText.Text = stats.lastAction
     if not state or not state.company then return end
     local c = state.company
     local hours = math.max((os.clock() - stats.startClock) / 3600, 1 / 3600)
@@ -768,21 +1043,33 @@ local function refreshStats(state)
     statLabels["Fuel"].Text = cap > 0 and string.format("%.0f%%  (%d/%d gal)", (c.fuel or 0) / cap * 100, math.floor(c.fuel or 0), math.floor(cap)) or "-"
     statLabels["Truck"].Text = string.format("Idle %d • Jalan %d • Rusak %d", idle, enroute, broken)
     statLabels["Dispatch"].Text = string.format("NPC %d • Sendiri %d • Pindah %d", stats.dispatchDriver, stats.dispatchSelf, stats.repositions)
+    statLabels["Bank"].Text = fmt(c.bank and c.bank.balance or 0)
+    statLabels["Withdraw"].Text = string.format("%dx • %s", stats.withdraws, fmt(stats.withdrawn))
     statLabels["Refuel"].Text = string.format("%dx • %d gal • ~%s", stats.refuels, stats.gallons, fmt(stats.fuelSpent))
     statLabels["Repair"].Text = string.format("%dx • %s", stats.repairs, fmt(stats.repairSpent))
     statLabels["Claim"].Text = string.format("Daily %d • Play %d • Offline %d", stats.daily, stats.playtime, stats.offline)
     statLabels["Aksi"].Text = stats.lastAction
 end
 
--- minimize / close / hotkey
-local minimized = false
-minBtn.MouseButton1Click:Connect(function()
-    minimized = not minimized
-    tabBar.Visible = not minimized
-    pageFarm.Visible = (not minimized) and activePage == pageFarm
-    pageStats.Visible = (not minimized) and activePage == pageStats
-    main.Size = minimized and UDim2.fromOffset(340, 32) or UDim2.fromOffset(340, 460)
-end)
+-- ===== animasi buka / tutup / minimize =====
+local visible, minimized, busy = false, false, false
+
+local function openAnim()
+    visible = true
+    main.Visible = true
+    tween(scale, 0.55, { Scale = 1 }, Enum.EasingStyle.Back)
+    tween(main, 0.35, { GroupTransparency = 0 })
+end
+
+local function closeAnim(done)
+    visible = false
+    tween(scale, 0.3, { Scale = 0.86 }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+    tween(main, 0.3, { GroupTransparency = 1 }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+    task.delay(0.32, function()
+        main.Visible = false
+        if done then done() end
+    end)
+end
 
 local function cleanup()
     env.FleetEmpireRun = -1
@@ -791,20 +1078,78 @@ local function cleanup()
     pcall(function() gui:Destroy() end)
 end
 env.FleetEmpireCleanup = cleanup
-closeBtn.MouseButton1Click:Connect(cleanup)
+
+closeBtn.MouseButton1Click:Connect(function()
+    if busy then return end
+    busy = true
+    closeAnim(cleanup)
+end)
+
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    local function setContent(show)
+        tabControl.Visible = show
+        footer.Visible = show
+        pages[activeKey].Visible = show
+    end
+    if minimized then
+        task.delay(0.2, function() if minimized then setContent(false) end end)
+    else
+        setContent(true)
+    end
+    local targetH = minimized and HEADER or H
+    local delta = (minimized and -(H - HEADER) or (H - HEADER)) / 2
+    tween(main, 0.45, {
+        Size = UDim2.fromOffset(W, targetH),
+        Position = UDim2.new(main.Position.X.Scale, main.Position.X.Offset, main.Position.Y.Scale, main.Position.Y.Offset + delta),
+    }, Enum.EasingStyle.Quint)
+end)
 
 track(UIS.InputBegan:Connect(function(i, processed)
-    if not processed and i.KeyCode == Enum.KeyCode.RightShift then main.Visible = not main.Visible end
+    if processed or i.KeyCode ~= Enum.KeyCode.RightShift or busy then return end
+    if visible then closeAnim() else openAnim() end
+end))
+
+-- drag lewat header
+local dragging, dragStart, startPos
+track(header.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        dragging, dragStart, startPos = true, i.Position, main.Position
+        i.Changed:Connect(function()
+            if i.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+end))
+track(UIS.InputChanged:Connect(function(i)
+    if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+        local d = i.Position - dragStart
+        main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end
 end))
 
 ------------------------------------------------
 -- MAIN LOOP
 ------------------------------------------------
 setAntiAfk(cfg.antiAfk)
+openAnim()
+
+if cfg.autoExecute then
+    local ok, why = queueReload()
+    if ok then
+        note("Auto Execute siap")
+    else
+        note("Auto Execute: " .. tostring(why))
+        warn("[FleetEmpire] Auto Execute belum aktif: " .. tostring(why))
+    end
+end
 
 task.spawn(function()
+    local tick_ = 0
     while alive() do
         task.wait(1)
+        tick_ += 1
+        if cfg.autoExecute and not queued and tick_ % 30 == 0 then queueReload() end -- file mungkin baru disimpan
+
         local state = getState()
         if state and state.company then
             local ok, err = pcall(runTick, state)
