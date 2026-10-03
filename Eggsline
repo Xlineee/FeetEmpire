@@ -1,0 +1,817 @@
+--[[
+    FLEET EMPIRE - AUTO FARM
+    Fitur:
+      1. Auto Claim Daily + Playtime
+      2. Auto Collect Offline Report
+      3. Auto Dispatch (Driver NPC & Truck sendiri dipisah) - mode: $/mile, Highest payout, Shortest
+      4. Auto Refuel (fuel perusahaan)
+      5. Auto Repair (Driver NPC / Truck sendiri dipisah)
+      6. Anti AFK
+      7. Panel statistik
+
+    Semua aksi memakai remote yang sama dengan UI game:
+      ClaimDaily()                          ClaimPlaytime(index)       CollectOfflineReport()
+      AcceptJob(bizId, loadKey)             -> dispatch truck sendiri
+      ManualDispatch(npcId, bizId, loadKey) -> dispatch driver NPC
+      TravelTo(origin) / ManualReposition(npcId, origin)               -> pindah (deadhead)
+      RefuelCompany(gallons)
+      RepairCompanyVehicleComponent(vehUid, comp) / RoadsideRepair(vehUid)
+
+    Hotkey: RightShift = sembunyikan / tampilkan window
+]]
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+local VirtualUser = game:GetService("VirtualUser")
+local CoreGui = game:GetService("CoreGui")
+local lp = Players.LocalPlayer
+
+------------------------------------------------
+-- RE-EXECUTE CLEANUP
+------------------------------------------------
+local env = (getgenv and getgenv()) or _G
+if env.FleetEmpireCleanup then pcall(env.FleetEmpireCleanup) end
+local runId = (tonumber(env.FleetEmpireRun) or 0) + 1
+env.FleetEmpireRun = runId
+local function alive() return env.FleetEmpireRun == runId end
+
+local connections = {}
+local function track(c) connections[#connections + 1] = c return c end
+
+------------------------------------------------
+-- MODULES & REMOTES
+------------------------------------------------
+local TC = RS:WaitForChild("TransportCo")
+local Remotes = TC:WaitForChild("Remotes")
+local VehicleMath = require(TC.Shared.VehicleMath)
+local GameConfig = require(TC.Config.GameConfig)
+local Vehicles = require(TC.Config.Vehicles)
+
+local StateController
+pcall(function()
+    StateController = require(lp:WaitForChild("PlayerScripts"):WaitForChild("TransportCo", 10):WaitForChild("Controllers", 10):WaitForChild("StateController", 10))
+end)
+
+local cachedState, lastFetch = nil, 0
+local function getState()
+    if StateController then
+        local ok, s = pcall(function() return StateController:Get() end)
+        if ok and type(s) == "table" and s.company then return s end
+    end
+    if os.clock() - lastFetch > 3 then
+        lastFetch = os.clock()
+        local ok, s = pcall(function() return Remotes.GetState:InvokeServer() end)
+        if ok and type(s) == "table" then cachedState = s end
+    end
+    return cachedState
+end
+
+local function fire(name, ...)
+    local r = Remotes:FindFirstChild(name)
+    if r and r:IsA("RemoteEvent") then
+        r:FireServer(...)
+        return true
+    end
+    return false
+end
+
+------------------------------------------------
+-- CONFIG (auto simpan kalau executor punya writefile)
+------------------------------------------------
+local CFG_FILE = "FleetEmpire_AutoFarm.json"
+local cfg = {
+    claimDaily = false,
+    claimPlaytime = false,
+    offlineReport = false,
+
+    dispatchDriver = false,
+    modeDriver = "perMile",
+    dispatchSelf = false,
+    modeSelf = "perMile",
+    reposition = true,
+
+    refuel = false,
+    refuelBelow = 40,   -- refuel kalau fuel <= x%
+    refuelTo = 100,     -- isi sampai x%
+
+    repairDriver = false,
+    repairSelf = false,
+    repairBelow = 70,   -- repair komponen kalau condition < x%
+
+    antiAfk = false,
+}
+
+pcall(function()
+    if isfile and readfile and isfile(CFG_FILE) then
+        local saved = HttpService:JSONDecode(readfile(CFG_FILE))
+        for k, v in pairs(saved) do
+            if cfg[k] ~= nil and type(v) == type(cfg[k]) then cfg[k] = v end
+        end
+    end
+end)
+
+local function saveCfg()
+    pcall(function()
+        if writefile then writefile(CFG_FILE, HttpService:JSONEncode(cfg)) end
+    end)
+end
+
+------------------------------------------------
+-- STATISTIK
+------------------------------------------------
+local stats = {
+    startClock = os.clock(),
+    startCash = nil,
+    startDeliveries = nil,
+    dispatchDriver = 0,
+    dispatchSelf = 0,
+    repositions = 0,
+    refuels = 0,
+    gallons = 0,
+    fuelSpent = 0,
+    repairs = 0,
+    repairSpent = 0,
+    daily = 0,
+    playtime = 0,
+    offline = 0,
+    lastAction = "-",
+}
+local function note(msg) stats.lastAction = msg end
+
+------------------------------------------------
+-- LOGIKA DISPATCH (meniru board load milik game)
+------------------------------------------------
+local MODE_ORDER = { "perMile", "payout", "distance" }
+local MODE_LABEL = { perMile = "$ / Mile", payout = "Highest Payout", distance = "Shortest" }
+
+local function buildRows(state, capacity, originState, vehTypeId, mileage, fuel)
+    local rows = {}
+    local payMap = (GameConfig.Economy and GameConfig.Economy.StatePayMultiplier) or {}
+    for bizId, b in pairs(state.businesses or {}) do
+        if (b.pool or 0) > 0 and (originState == nil or table.find(b.points or {}, originState)) then
+            local okCarry, canCarry = pcall(VehicleMath.canCarry, vehTypeId, b.cargo)
+            if okCarry and canCarry then
+                local origin = originState or (b.points and b.points[1]) or b.headquarters
+                if origin then
+                    local statePay = payMap[origin] or 1
+                    local cargoMult = 1
+                    pcall(function() cargoMult = VehicleMath.cargoPayMult(b.cargo) or 1 end)
+                    for loadKey, ld in pairs(b.loads or {}) do
+                        local dist = math.max(1, ld.distance or 1)
+                        local rate = 1
+                        local okR, r = pcall(VehicleMath.loadRateMult, bizId, loadKey)
+                        if okR and type(r) == "number" then rate = r end
+                        local rpp = math.max(1, math.floor(VehicleMath.baseRewardPerPallet(dist) * rate * statePay * (b.spotRate or 1) * cargoMult + 0.5))
+                        local payout = math.floor(rpp * math.min(capacity, b.pool) + 0.5)
+                        local gallons = 0
+                        local okG, g = pcall(VehicleMath.deliveryGallons, vehTypeId, mileage or 0, dist, nil)
+                        if okG and type(g) == "number" then gallons = g * 1.15 end
+                        rows[#rows + 1] = {
+                            bizId = bizId,
+                            loadKey = loadKey,
+                            origin = origin,
+                            destination = ld.destination,
+                            cargo = b.cargo,
+                            distance = dist,
+                            payout = payout,
+                            perMile = payout / dist,
+                            gallons = gallons,
+                        }
+                    end
+                end
+            end
+        end
+    end
+    return rows
+end
+
+local function sortRows(rows, mode)
+    table.sort(rows, function(a, b)
+        if mode == "distance" then
+            if a.distance ~= b.distance then return a.distance < b.distance end
+            return a.payout > b.payout
+        elseif mode == "payout" then
+            if a.payout ~= b.payout then return a.payout > b.payout end
+            return a.distance < b.distance
+        end
+        if a.perMile ~= b.perMile then return a.perMile > b.perMile end
+        return a.payout > b.payout
+    end)
+end
+
+------------------------------------------------
+-- AKSI OTOMATIS
+------------------------------------------------
+local cd = {}                -- cooldown generik
+local pendingDispatch = {}   -- [vehUid] = { t, key }
+local failedLoads = {}       -- [vehUid|biz|key] = expiry
+local lastReposition = {}    -- [vehUid] = expiry
+local repairCd = {}          -- [vehUid] = expiry
+local forceRefuel = false
+local offState = { at = nil, t = 0 }
+
+local function ready(key, secs)
+    local now = os.clock()
+    if now < (cd[key] or 0) then return false end
+    cd[key] = now + secs
+    return true
+end
+
+local function pretty(s) return (tostring(s or ""):gsub("(%l)(%u)", "%1 %2")) end
+
+-- 1) claim daily / playtime / offline report
+local function doClaims(state)
+    if cfg.claimDaily and state.daily and state.daily.claimable == true and ready("daily", 10) then
+        if fire("ClaimDaily") then
+            stats.daily += 1
+            note("Claim Daily reward")
+        end
+    end
+
+    if cfg.claimPlaytime and state.playtime and type(state.playtime.milestones) == "table" then
+        for _, m in pairs(state.playtime.milestones) do
+            if m.reached and not m.claimed and ready("pt" .. tostring(m.index), 10) then
+                local idx = m.index
+                local label = m.label
+                task.spawn(function()
+                    local ok, res = pcall(function() return Remotes.ClaimPlaytime:InvokeServer(idx) end)
+                    if ok and type(res) == "table" and res.ok then
+                        stats.playtime += 1
+                        note("Claim Playtime: " .. tostring(label))
+                    end
+                end)
+            end
+        end
+    end
+
+    local rep = state.company and state.company.offlineReport
+    if cfg.offlineReport and rep then
+        if rep.at ~= offState.at or os.clock() > offState.t + 20 then
+            offState.at = rep.at
+            offState.t = os.clock()
+            if fire("CollectOfflineReport") then
+                stats.offline += 1
+                note("Collect Offline Report")
+                pcall(function()
+                    for _, d in ipairs(lp.PlayerGui:GetDescendants()) do
+                        if d.Name == "OfflineReport" and d:IsA("Frame") then d:Destroy() end
+                    end
+                end)
+            end
+        end
+    end
+end
+
+-- 2) refuel (fuel perusahaan dipakai semua truck)
+local function doRefuel(state)
+    if not cfg.refuel then return end
+    local c = state.company
+    local cap = c.fuelCapacity or 0
+    local fuel = c.fuel or 0
+    if cap <= 0 then return end
+    local pct = fuel / cap * 100
+    local forced = forceRefuel
+    if not forced and pct > cfg.refuelBelow then return end
+    if not ready("refuel", 4) then return end
+
+    local targetPct = forced and 100 or cfg.refuelTo
+    local gallons = math.ceil(targetPct / 100 * cap - fuel)
+    if gallons < 1 then forceRefuel = false return end
+
+    local price = state.fuelPrice or 20
+    gallons = math.min(gallons, math.floor((c.cash or 0) / math.max(price, 0.01) * 0.95))
+    if gallons < 1 then return end
+
+    if fire("RefuelCompany", gallons) then
+        forceRefuel = false
+        stats.refuels += 1
+        stats.gallons += gallons
+        stats.fuelSpent += gallons * price
+        note(string.format("Refuel +%d gal", gallons))
+    end
+end
+
+-- 3) repair
+local COMPONENTS = { "engine", "tires", "brakes", "transmission" }
+local function repairDiscount(company)
+    local m = company.upgrades and company.upgrades.maintenance
+    if m and m.repairPerLevel then
+        return math.max(m.repairFloor or 0, 1 - (m.level or 0) * m.repairPerLevel)
+    end
+    return 1
+end
+
+-- return true kalau ada repair yang dikirim
+local function doRepair(state, uid, veh)
+    if os.clock() < (repairCd[uid] or 0) then return true end
+    local company = state.company
+    local cash = company.cash or 0
+
+    if veh.status == "Broken" then
+        repairCd[uid] = os.clock() + 4
+        if fire("RoadsideRepair", uid) then
+            stats.repairs += 1
+            note("Roadside repair " .. tostring(veh.plate or uid))
+        end
+        return true
+    end
+    if veh.status ~= "Idle" then return false end
+
+    local disc = repairDiscount(company)
+    local fired = false
+    for _, comp in ipairs(COMPONENTS) do
+        local cond = (veh.condition or {})[comp] or 100
+        if cond < cfg.repairBelow then
+            local okC, cost = pcall(VehicleMath.repairCost, veh.id, comp, cond, veh.mileage)
+            cost = okC and type(cost) == "number" and math.ceil(cost * disc) or 0
+            if cost <= cash then
+                if fire("RepairCompanyVehicleComponent", uid, comp) then
+                    cash -= cost
+                    stats.repairs += 1
+                    stats.repairSpent += cost
+                    fired = true
+                    note(string.format("Repair %s (%s)", comp, tostring(veh.plate or uid)))
+                end
+            end
+        end
+    end
+    if fired then repairCd[uid] = os.clock() + 3 end
+    return fired
+end
+
+-- 4) dispatch satu kendaraan (kind = "driver" | "self")
+local function doDispatch(state, uid, veh, kind, npc)
+    local now = os.clock()
+    local mode = (kind == "driver") and cfg.modeDriver or cfg.modeSelf
+
+    local p = pendingDispatch[uid]
+    if p then
+        if now - p.t < 4 then return end
+        failedLoads[uid .. "|" .. p.key] = now + 90 -- masih Idle = ditolak server
+        pendingDispatch[uid] = nil
+    end
+
+    local def = Vehicles[veh.id]
+    local capacity = def and def.capacity or 0
+    if capacity <= 0 then return end
+    local company = state.company
+    local fuel = company.fuel or 0
+
+    local rows = buildRows(state, capacity, veh.location, veh.id, veh.mileage, nil)
+    local usable, blockedByFuel = {}, false
+    for _, r in ipairs(rows) do
+        if (failedLoads[uid .. "|" .. r.bizId .. "|" .. tostring(r.loadKey)] or 0) <= now then
+            if r.gallons <= fuel then
+                usable[#usable + 1] = r
+            else
+                blockedByFuel = true
+            end
+        end
+    end
+
+    if #usable > 0 then
+        sortRows(usable, mode)
+        local r = usable[1]
+        local ok
+        if kind == "driver" then
+            ok = fire("ManualDispatch", npc.id, r.bizId, r.loadKey)
+        else
+            ok = fire("AcceptJob", r.bizId, r.loadKey)
+        end
+        if ok then
+            pendingDispatch[uid] = { t = now, key = r.bizId .. "|" .. tostring(r.loadKey) }
+            if kind == "driver" then stats.dispatchDriver += 1 else stats.dispatchSelf += 1 end
+            note(string.format("%s: %s %s -> %s  %d mi  $%d",
+                kind == "driver" and (npc.name or "Driver") or "Truck sendiri",
+                tostring(r.cargo), pretty(r.origin), pretty(r.destination), r.distance, r.payout))
+        end
+        return
+    end
+
+    if blockedByFuel then
+        if cfg.refuel then forceRefuel = true end -- ada load tapi fuel kurang -> isi sampai penuh
+        return
+    end
+
+    -- tidak ada load di state ini -> pindahkan (deadhead) ke state yang punya load
+    if cfg.reposition and now > (lastReposition[uid] or 0) then
+        local all = buildRows(state, capacity, nil, veh.id, veh.mileage, nil)
+        local far = {}
+        for _, r in ipairs(all) do
+            if r.origin ~= veh.location then far[#far + 1] = r end
+        end
+        sortRows(far, mode)
+        local t = far[1]
+        if t then
+            lastReposition[uid] = now + 45
+            local ok
+            if kind == "driver" then
+                ok = fire("ManualReposition", npc.id, t.origin)
+            else
+                ok = fire("TravelTo", t.origin)
+            end
+            if ok then
+                stats.repositions += 1
+                note(string.format("Pindah %s ke %s", kind == "driver" and (npc.name or "Driver") or "truck sendiri", pretty(t.origin)))
+            end
+        end
+    end
+end
+
+local function processVehicle(state, uid, veh, kind, npc)
+    if type(veh) ~= "table" then return end
+    local repairOn = (kind == "driver" and cfg.repairDriver) or (kind == "self" and cfg.repairSelf)
+    local dispatchOn = (kind == "driver" and cfg.dispatchDriver) or (kind == "self" and cfg.dispatchSelf)
+
+    if veh.status ~= "Idle" then pendingDispatch[uid] = nil end
+
+    if repairOn then
+        local busy = doRepair(state, uid, veh)
+        if busy then return end -- tunggu state ter-update sebelum dispatch
+    end
+    if dispatchOn and veh.status == "Idle" then
+        doDispatch(state, uid, veh, kind, npc)
+    end
+end
+
+local function runTick(state)
+    local company = state.company
+    if not company then return end
+
+    if stats.startCash == nil then
+        stats.startCash = company.cash or 0
+        stats.startDeliveries = state.stats and state.stats.deliveries or 0
+    end
+
+    doClaims(state)
+    doRefuel(state)
+
+    local vehicles = company.vehicles or {}
+
+    if company.myVehicleUid and vehicles[company.myVehicleUid] then
+        processVehicle(state, company.myVehicleUid, vehicles[company.myVehicleUid], "self", nil)
+    end
+
+    for _, npc in pairs(company.npcs or {}) do
+        local uid = npc.assignedVehicleUid
+        if uid and vehicles[uid] then
+            processVehicle(state, uid, vehicles[uid], "driver", npc)
+        end
+    end
+end
+
+------------------------------------------------
+-- ANTI AFK
+------------------------------------------------
+local afkConn
+local function setAntiAfk(on)
+    if on and not afkConn then
+        afkConn = lp.Idled:Connect(function()
+            pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new())
+            end)
+        end)
+    elseif not on and afkConn then
+        afkConn:Disconnect()
+        afkConn = nil
+    end
+end
+
+------------------------------------------------
+-- GUI
+------------------------------------------------
+local function new(class, props, parent)
+    local i = Instance.new(class)
+    for k, v in pairs(props or {}) do i[k] = v end
+    if parent then i.Parent = parent end
+    return i
+end
+
+local function guiParent()
+    local ok, h = pcall(function() return gethui and gethui() end)
+    if ok and h then return h end
+    local ok2 = pcall(function() return CoreGui.Name end)
+    if ok2 then return CoreGui end
+    return lp:WaitForChild("PlayerGui")
+end
+
+local C = {
+    bg = Color3.fromRGB(22, 24, 30),
+    panel = Color3.fromRGB(32, 35, 44),
+    title = Color3.fromRGB(40, 44, 56),
+    text = Color3.fromRGB(225, 228, 235),
+    muted = Color3.fromRGB(140, 146, 160),
+    on = Color3.fromRGB(40, 160, 80),
+    off = Color3.fromRGB(70, 74, 86),
+    accent = Color3.fromRGB(240, 170, 40),
+}
+
+local gui = new("ScreenGui", { Name = "FleetEmpireFarm", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling }, nil)
+gui.Parent = guiParent()
+
+local main = new("Frame", {
+    Size = UDim2.fromOffset(340, 460),
+    Position = UDim2.new(0, 24, 0.5, -230),
+    BackgroundColor3 = C.bg,
+    BorderSizePixel = 0,
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
+new("UIStroke", { Color = C.accent, Thickness = 1, Transparency = 0.5 }, main)
+
+local titleBar = new("Frame", { Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = C.title, BorderSizePixel = 0 }, main)
+new("UICorner", { CornerRadius = UDim.new(0, 10) }, titleBar)
+new("TextLabel", {
+    Size = UDim2.new(1, -80, 1, 0), Position = UDim2.fromOffset(12, 0), BackgroundTransparency = 1,
+    Text = "Fleet Empire  •  Auto Farm", TextColor3 = C.accent, Font = Enum.Font.GothamBold, TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, titleBar)
+
+local minBtn = new("TextButton", {
+    Size = UDim2.fromOffset(26, 22), Position = UDim2.new(1, -62, 0, 5), BackgroundColor3 = C.off,
+    Text = "–", TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 14, BorderSizePixel = 0,
+}, titleBar)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, minBtn)
+local closeBtn = new("TextButton", {
+    Size = UDim2.fromOffset(26, 22), Position = UDim2.new(1, -32, 0, 5), BackgroundColor3 = Color3.fromRGB(170, 55, 55),
+    Text = "X", TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 12, BorderSizePixel = 0,
+}, titleBar)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, closeBtn)
+
+-- drag
+local dragging, dragStart, startPos
+track(titleBar.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        dragging, dragStart, startPos = true, i.Position, main.Position
+        i.Changed:Connect(function()
+            if i.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+end))
+track(UIS.InputChanged:Connect(function(i)
+    if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+        local d = i.Position - dragStart
+        main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end
+end))
+
+-- tabs
+local tabBar = new("Frame", { Size = UDim2.new(1, -16, 0, 26), Position = UDim2.fromOffset(8, 38), BackgroundTransparency = 1 }, main)
+new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6) }, tabBar)
+
+local function makePage()
+    local f = new("ScrollingFrame", {
+        Size = UDim2.new(1, -16, 1, -76), Position = UDim2.fromOffset(8, 68), BackgroundTransparency = 1,
+        BorderSizePixel = 0, ScrollBarThickness = 3, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    }, main)
+    new("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, f)
+    return f
+end
+
+local pageFarm, pageStats = makePage(), makePage()
+pageStats.Visible = false
+local tabButtons = {}
+local activePage = pageFarm
+
+local function makeTab(label, page)
+    local b = new("TextButton", {
+        Size = UDim2.fromOffset(100, 26), BackgroundColor3 = C.off, Text = label, TextColor3 = C.text,
+        Font = Enum.Font.GothamBold, TextSize = 12, BorderSizePixel = 0,
+    }, tabBar)
+    new("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
+    tabButtons[#tabButtons + 1] = { b = b, page = page }
+    b.MouseButton1Click:Connect(function()
+        activePage = page
+        for _, t in ipairs(tabButtons) do
+            t.page.Visible = (t.page == page)
+            t.b.BackgroundColor3 = (t.page == page) and C.accent or C.off
+            t.b.TextColor3 = (t.page == page) and Color3.fromRGB(20, 20, 20) or C.text
+        end
+    end)
+    return b
+end
+local tabFarm = makeTab("Farm", pageFarm)
+makeTab("Statistik", pageStats)
+tabFarm.BackgroundColor3 = C.accent
+tabFarm.TextColor3 = Color3.fromRGB(20, 20, 20)
+
+local order = 0
+local function nextOrder() order += 1 return order end
+
+local function header(parent, text)
+    new("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1, Text = text, TextColor3 = C.accent,
+        Font = Enum.Font.GothamBold, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = nextOrder(),
+    }, parent)
+end
+
+local function row(parent)
+    local r = new("Frame", { Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = C.panel, BorderSizePixel = 0, LayoutOrder = nextOrder() }, parent)
+    new("UICorner", { CornerRadius = UDim.new(0, 6) }, r)
+    return r
+end
+
+local function rowLabel(r, text)
+    return new("TextLabel", {
+        Size = UDim2.new(0.58, 0, 1, 0), Position = UDim2.fromOffset(8, 0), BackgroundTransparency = 1, Text = text,
+        TextColor3 = C.text, Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+    }, r)
+end
+
+local function makeToggle(parent, label, key, hook)
+    local r = row(parent)
+    rowLabel(r, label)
+    local b = new("TextButton", {
+        Size = UDim2.fromOffset(54, 20), Position = UDim2.new(1, -60, 0.5, -10), BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold, TextSize = 11,
+    }, r)
+    new("UICorner", { CornerRadius = UDim.new(0, 5) }, b)
+    local function refresh()
+        b.Text = cfg[key] and "ON" or "OFF"
+        b.BackgroundColor3 = cfg[key] and C.on or C.off
+        b.TextColor3 = cfg[key] and Color3.new(1, 1, 1) or C.muted
+    end
+    refresh()
+    b.MouseButton1Click:Connect(function()
+        cfg[key] = not cfg[key]
+        refresh()
+        saveCfg()
+        if hook then hook(cfg[key]) end
+    end)
+end
+
+local function makeCycle(parent, label, key, order_, labels)
+    local r = row(parent)
+    rowLabel(r, label)
+    local b = new("TextButton", {
+        Size = UDim2.fromOffset(112, 20), Position = UDim2.new(1, -118, 0.5, -10), BorderSizePixel = 0,
+        BackgroundColor3 = C.off, TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 11,
+    }, r)
+    new("UICorner", { CornerRadius = UDim.new(0, 5) }, b)
+    local function refresh() b.Text = labels[cfg[key]] or tostring(cfg[key]) end
+    refresh()
+    b.MouseButton1Click:Connect(function()
+        local idx = table.find(order_, cfg[key]) or 0
+        cfg[key] = order_[(idx % #order_) + 1]
+        refresh()
+        saveCfg()
+    end)
+end
+
+local function makeStepper(parent, label, key, minv, maxv, step)
+    local r = row(parent)
+    rowLabel(r, label)
+    local function btn(txt, x)
+        local b = new("TextButton", {
+            Size = UDim2.fromOffset(22, 20), Position = UDim2.new(1, x, 0.5, -10), BackgroundColor3 = C.off, BorderSizePixel = 0,
+            Text = txt, TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 13,
+        }, r)
+        new("UICorner", { CornerRadius = UDim.new(0, 5) }, b)
+        return b
+    end
+    local minus, plus = btn("-", -92), btn("+", -28)
+    local val = new("TextLabel", {
+        Size = UDim2.fromOffset(40, 20), Position = UDim2.new(1, -68, 0.5, -10), BackgroundTransparency = 1,
+        TextColor3 = C.accent, Font = Enum.Font.GothamBold, TextSize = 12,
+    }, r)
+    local function refresh() val.Text = tostring(cfg[key]) .. "%" end
+    refresh()
+    minus.MouseButton1Click:Connect(function() cfg[key] = math.max(minv, cfg[key] - step) refresh() saveCfg() end)
+    plus.MouseButton1Click:Connect(function() cfg[key] = math.min(maxv, cfg[key] + step) refresh() saveCfg() end)
+end
+
+-- ===== TAB FARM =====
+header(pageFarm, "AUTO CLAIM")
+makeToggle(pageFarm, "Claim Daily Reward", "claimDaily")
+makeToggle(pageFarm, "Claim Playtime Reward", "claimPlaytime")
+makeToggle(pageFarm, "Collect Offline Report", "offlineReport")
+
+header(pageFarm, "AUTO DISPATCH - DRIVER NPC")
+makeToggle(pageFarm, "Dispatch Driver", "dispatchDriver")
+makeCycle(pageFarm, "Mode Driver", "modeDriver", MODE_ORDER, MODE_LABEL)
+
+header(pageFarm, "AUTO DISPATCH - TRUCK SENDIRI")
+makeToggle(pageFarm, "Dispatch Truck Sendiri", "dispatchSelf")
+makeCycle(pageFarm, "Mode Truck Sendiri", "modeSelf", MODE_ORDER, MODE_LABEL)
+makeToggle(pageFarm, "Pindah kalau tak ada load", "reposition")
+
+header(pageFarm, "AUTO REFUEL")
+makeToggle(pageFarm, "Auto Refuel", "refuel")
+makeStepper(pageFarm, "Refuel jika fuel <=", "refuelBelow", 5, 95, 5)
+makeStepper(pageFarm, "Isi sampai", "refuelTo", 20, 100, 5)
+
+header(pageFarm, "AUTO REPAIR")
+makeToggle(pageFarm, "Repair Driver NPC", "repairDriver")
+makeToggle(pageFarm, "Repair Truck Sendiri", "repairSelf")
+makeStepper(pageFarm, "Repair jika kondisi <", "repairBelow", 10, 99, 5)
+
+header(pageFarm, "UTILITAS")
+makeToggle(pageFarm, "Anti AFK", "antiAfk", setAntiAfk)
+
+-- ===== TAB STATISTIK =====
+local statLabels = {}
+local function statRow(name)
+    local r = row(pageStats)
+    rowLabel(r, name).Size = UDim2.new(0.34, 0, 1, 0)
+    local v = new("TextLabel", {
+        Size = UDim2.new(0.64, -12, 1, 0), Position = UDim2.new(0.34, 4, 0, 0), BackgroundTransparency = 1, Text = "-",
+        TextColor3 = C.accent, Font = Enum.Font.GothamBold, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Right,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, r)
+    statLabels[name] = v
+    return v
+end
+
+header(pageStats, "SESI INI")
+for _, n in ipairs({ "Waktu jalan", "Cash", "Cash sesi", "Cash / jam", "Delivery sesi", "Delivery / jam" }) do statRow(n) end
+header(pageStats, "ARMADA")
+for _, n in ipairs({ "Fuel", "Truck", "Dispatch", "Refuel", "Repair", "Claim" }) do statRow(n) end
+header(pageStats, "AKSI TERAKHIR")
+statRow("Aksi")
+
+local function fmt(n)
+    n = math.floor((tonumber(n) or 0) + 0.5)
+    local neg = n < 0
+    local out = tostring(math.abs(n)):reverse():gsub("(%d%d%d)", "%1,"):reverse()
+    out = out:gsub("^,", "")
+    return (neg and "-$" or "$") .. out
+end
+
+local function fmtTime(sec)
+    sec = math.floor(sec)
+    return string.format("%02d:%02d:%02d", sec // 3600, (sec % 3600) // 60, sec % 60)
+end
+
+local function refreshStats(state)
+    if not state or not state.company then return end
+    local c = state.company
+    local hours = math.max((os.clock() - stats.startClock) / 3600, 1 / 3600)
+    local cash = c.cash or 0
+    local cashDelta = cash - (stats.startCash or cash)
+    local deliv = (state.stats and state.stats.deliveries or 0)
+    local delivDelta = deliv - (stats.startDeliveries or deliv)
+
+    local idle, enroute, broken = 0, 0, 0
+    for _, v in pairs(c.vehicles or {}) do
+        if v.status == "Idle" then idle += 1 elseif v.status == "Broken" then broken += 1 else enroute += 1 end
+    end
+    local cap = c.fuelCapacity or 0
+
+    statLabels["Waktu jalan"].Text = fmtTime(os.clock() - stats.startClock)
+    statLabels["Cash"].Text = fmt(cash)
+    statLabels["Cash sesi"].Text = (cashDelta >= 0 and "+" or "") .. fmt(cashDelta)
+    statLabels["Cash / jam"].Text = fmt(cashDelta / hours)
+    statLabels["Delivery sesi"].Text = tostring(delivDelta)
+    statLabels["Delivery / jam"].Text = string.format("%.1f", delivDelta / hours)
+    statLabels["Fuel"].Text = cap > 0 and string.format("%.0f%%  (%d/%d gal)", (c.fuel or 0) / cap * 100, math.floor(c.fuel or 0), math.floor(cap)) or "-"
+    statLabels["Truck"].Text = string.format("Idle %d • Jalan %d • Rusak %d", idle, enroute, broken)
+    statLabels["Dispatch"].Text = string.format("NPC %d • Sendiri %d • Pindah %d", stats.dispatchDriver, stats.dispatchSelf, stats.repositions)
+    statLabels["Refuel"].Text = string.format("%dx • %d gal • ~%s", stats.refuels, stats.gallons, fmt(stats.fuelSpent))
+    statLabels["Repair"].Text = string.format("%dx • %s", stats.repairs, fmt(stats.repairSpent))
+    statLabels["Claim"].Text = string.format("Daily %d • Play %d • Offline %d", stats.daily, stats.playtime, stats.offline)
+    statLabels["Aksi"].Text = stats.lastAction
+end
+
+-- minimize / close / hotkey
+local minimized = false
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    tabBar.Visible = not minimized
+    pageFarm.Visible = (not minimized) and activePage == pageFarm
+    pageStats.Visible = (not minimized) and activePage == pageStats
+    main.Size = minimized and UDim2.fromOffset(340, 32) or UDim2.fromOffset(340, 460)
+end)
+
+local function cleanup()
+    env.FleetEmpireRun = -1
+    setAntiAfk(false)
+    for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+    pcall(function() gui:Destroy() end)
+end
+env.FleetEmpireCleanup = cleanup
+closeBtn.MouseButton1Click:Connect(cleanup)
+
+track(UIS.InputBegan:Connect(function(i, processed)
+    if not processed and i.KeyCode == Enum.KeyCode.RightShift then main.Visible = not main.Visible end
+end))
+
+------------------------------------------------
+-- MAIN LOOP
+------------------------------------------------
+setAntiAfk(cfg.antiAfk)
+
+task.spawn(function()
+    while alive() do
+        task.wait(1)
+        local state = getState()
+        if state and state.company then
+            local ok, err = pcall(runTick, state)
+            if not ok then warn("[FleetEmpire] tick error: " .. tostring(err)) end
+            pcall(refreshStats, state)
+        end
+    end
+end)
+
+print("[FleetEmpire] Auto Farm dimuat. RightShift = sembunyikan/tampilkan window.")
