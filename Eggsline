@@ -118,6 +118,11 @@ local cfg = {
     autoReconnect = true,
 
     antiAfk = false,
+
+    hideIdentity = false, -- mode streamer: nama tersamar jadi simbol acak (hanya di sisi kita)
+
+    winW = 0, -- ukuran window hasil resize (0 = default)
+    winH = 0,
 }
 
 pcall(function()
@@ -725,6 +730,13 @@ local ROW_H, STAT_H = 46, 38
 local vp = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2.new(1280, 720)
 local fit = math.clamp(math.min((vp.X - 30) / W, (vp.Y - 30) / H), 0.55, 1)
 
+-- Ukuran window yang aktif (bisa di-resize). W,H = ukuran default.
+local MIN_W, MIN_H = 330, 230
+local fullW = (cfg.winW >= MIN_W) and cfg.winW or W
+local fullH = (cfg.winH >= MIN_H) and cfg.winH or H
+fullW = math.floor(math.clamp(fullW, MIN_W, math.max((vp.X - 40) / fit, MIN_W)))
+fullH = math.floor(math.clamp(fullH, MIN_H, math.max((vp.Y - 40) / fit, MIN_H)))
+
 -- column width inside a page (page = W - 28, minus 6 scrollbar padding, minus 12 gap, split in 2)
 local COL_W = math.floor((W - 28 - 6 - 12) / 2)
 local SWITCH_W, MODE_W, STEP_W = 48, 222, 150
@@ -735,8 +747,8 @@ gui.Parent = guiParent()
 local main = new("CanvasGroup", {
     Name = "Glass",
     AnchorPoint = Vector2.new(0.5, 0.5),
-    Size = UDim2.fromOffset(W, H),
-    Position = UDim2.new(0, 24 + (W * fit) / 2, 0.5, 0),
+    Size = UDim2.fromOffset(fullW, fullH),
+    Position = UDim2.new(0, 24 + (fullW * fit) / 2, 0.5, 0),
     BackgroundColor3 = C.glass,
     BackgroundTransparency = 0.18,
     GroupTransparency = 1,
@@ -790,12 +802,12 @@ task.spawn(function()
     if ok and img and avatar.Parent then avatar.Image = img end
 end)
 
-new("TextLabel", {
+local nameLabel = new("TextLabel", {
     Size = UDim2.new(1, -150, 0, 22), Position = UDim2.fromOffset(68, 10), BackgroundTransparency = 1,
     Text = lp.DisplayName, TextColor3 = C.white, Font = Enum.Font.GothamBold, TextSize = 17,
     TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
 }, header)
-new("TextLabel", {
+local subLabel = new("TextLabel", {
     Size = UDim2.new(1, -150, 0, 16), Position = UDim2.fromOffset(68, 33), BackgroundTransparency = 1,
     Text = "@" .. lp.Name .. "  •  Fleet Empire", TextColor3 = C.sub, Font = Enum.Font.Gotham, TextSize = 13,
     TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
@@ -905,6 +917,7 @@ local function makeStepper(parent, getFn, setFn, minv, maxv, step, fmtFn)
     local minus, plus = btn("−", UDim2.fromOffset(0, 0)), btn("+", UDim2.new(1, -34, 0, 0))
     minus.MouseButton1Click:Connect(function() setFn(math.max(minv, getFn() - step)) refresh() end)
     plus.MouseButton1Click:Connect(function() setFn(math.min(maxv, getFn() + step)) refresh() end)
+    return box
 end
 
 -- ===== pages (each page = scrolling frame with 2 columns) =====
@@ -915,7 +928,7 @@ local function makePage()
         BorderSizePixel = 0, ScrollBarThickness = 3, ScrollBarImageColor3 = C.sub, CanvasSize = UDim2.new(),
         AutomaticCanvasSize = Enum.AutomaticSize.Y,
     }, main)
-    new("UIListLayout", {
+    local list = new("UIListLayout", {
         FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 12),
         SortOrder = Enum.SortOrder.LayoutOrder, VerticalAlignment = Enum.VerticalAlignment.Top,
     }, f)
@@ -929,13 +942,31 @@ local function makePage()
         c:SetAttribute("n", 0)
         cols[i] = c
     end
-    return { frame = f, cols = cols }
+    return { frame = f, cols = cols, list = list }
 end
 
 local pageFarm, pageStats = makePage(), makePage()
 pageStats.frame.Visible = false
 local pages = { farm = pageFarm.frame, stats = pageStats.frame }
 local activeKey = "farm"
+
+-- ===== layout responsif =====
+-- Lebar window >= SINGLE_COL_W  -> 2 kolom (landscape)
+-- Lebar window <  SINGLE_COL_W  -> 1 kolom (portrait), baris-baris menyesuaikan lebar
+local SINGLE_COL_W = 580
+local adaptives = {} -- fungsi(lebarKolom) milik baris yang ukurannya ikut lebar kolom
+
+local function applyLayout(w)
+    local single = w < SINGLE_COL_W
+    local colW = single and (w - 28 - 6) or math.floor((w - 28 - 6 - 12) / 2)
+    for _, pg in ipairs({ pageFarm, pageStats }) do
+        pg.list.FillDirection = single and Enum.FillDirection.Vertical or Enum.FillDirection.Horizontal
+        for _, c in ipairs(pg.cols) do
+            c.Size = single and UDim2.new(1, 0, 0, 0) or UDim2.new(0.5, -6, 0, 0)
+        end
+    end
+    for _, fn in ipairs(adaptives) do fn(colW) end
+end
 
 local function showPage(key)
     activeKey = key
@@ -1007,20 +1038,197 @@ end
 
 local function modeRow(card, label, key)
     local r = newRow(card, label, ROW_H, UDim2.new(1, -(MODE_W + 36), 1, 0))
-    makeSegmented(r, MODE_OPTIONS, function() return cfg[key] end, function(v) cfg[key] = v saveCfg() end, {
+    local lbl = r:FindFirstChildOfClass("TextLabel")
+    local seg = makeSegmented(r, MODE_OPTIONS, function() return cfg[key] end, function(v) cfg[key] = v saveCfg() end, {
         Size = UDim2.fromOffset(MODE_W, 30), AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -14, 0.5, 0),
     })
+    -- kontrol mengecil kalau kolom sempit (portrait) supaya label tidak kejepit
+    adaptives[#adaptives + 1] = function(rowW)
+        local cw = math.clamp(math.floor(rowW * 0.58), 150, MODE_W)
+        seg.Size = UDim2.fromOffset(cw, 30)
+        lbl.Size = UDim2.new(1, -(cw + 36), 1, 0)
+    end
 end
 
 local function stepperRow(card, label, key, minv, maxv, step, fmtFn)
     local r = newRow(card, label, ROW_H, UDim2.new(1, -(STEP_W + 36), 1, 0))
-    makeStepper(r, function() return cfg[key] end, function(v) cfg[key] = v saveCfg() end, minv, maxv, step, fmtFn)
+    local lbl = r:FindFirstChildOfClass("TextLabel")
+    local box = makeStepper(r, function() return cfg[key] end, function(v) cfg[key] = v saveCfg() end, minv, maxv, step, fmtFn)
+    adaptives[#adaptives + 1] = function(rowW)
+        local cw = math.clamp(math.floor(rowW * 0.42), 112, STEP_W)
+        box.Size = UDim2.fromOffset(cw, 30)
+        lbl.Size = UDim2.new(1, -(cw + 36), 1, 0)
+    end
 end
 
 local pct = function(v) return tostring(v) .. "%" end
 local function shortMoney(v)
     if v >= 1000000 then return string.format("$%.1fM", v / 1000000) end
     return string.format("$%dk", math.floor(v / 1000))
+end
+
+-- ===== HIDE IDENTITY (mode streamer) =====
+-- ON : nama kamu (username + display name) diganti simbol acak yang berganti tiap frame,
+--      di panel ini DAN di UI game (mis. di bawah nama company). Hanya visual di sisi kita.
+-- OFF: semua teks dikembalikan seperti semula.
+local IdentityRun = game:GetService("RunService")
+local IDENTITY_INTERVAL = 0 -- jeda antar acak (detik). 0 = tiap frame (secepat mungkin)
+local IDENTITY_RESCAN = 4   -- detik, cari teks baru di UI game yang memuat nama kita
+
+local GLYPHS = {}
+do
+    local function range(a, b) for c = a, b do GLYPHS[#GLYPHS + 1] = c end end
+    range(0xFF66, 0xFF9D)          -- katakana half-width (gaya Matrix)
+    range(0x2591, 0x2593)          -- ░ ▒ ▓
+    GLYPHS[#GLYPHS + 1] = 0x2588   -- █
+    for _, b in ipairs({ string.byte("!@#$%&*<>/\\|=+-~0123456789", 1, -1) }) do GLYPHS[#GLYPHS + 1] = b end
+end
+
+local function glitch(n)
+    local out = table.create(n)
+    for i = 1, n do out[i] = utf8.char(GLYPHS[math.random(#GLYPHS)]) end
+    return table.concat(out)
+end
+
+local idNames = {}
+do
+    local seen = {}
+    for _, n in ipairs({ lp.Name, lp.DisplayName }) do
+        local k = n:lower()
+        if #n >= 1 and not seen[k] then seen[k] = true idNames[#idNames + 1] = n end
+    end
+    table.sort(idNames, function(a, b) return #a > #b end) -- nama terpanjang dulu
+end
+
+local function isWordChar(c) return c ~= "" and c:match("[%w_]") ~= nil end
+
+-- ganti semua kemunculan nama (tidak peka huruf besar/kecil, hanya kata utuh) dengan simbol acak
+local function scramble(text)
+    local changed = false
+    for _, name in ipairs(idNames) do
+        local lt, ln = text:lower(), name:lower()
+        local out, i = {}, 1
+        while true do
+            local s_, e_ = lt:find(ln, i, true)
+            if not s_ then break end
+            local before = s_ > 1 and text:sub(s_ - 1, s_ - 1) or ""
+            local after = text:sub(e_ + 1, e_ + 1)
+            if not isWordChar(before) and not isWordChar(after) then
+                out[#out + 1] = text:sub(i, s_ - 1)
+                out[#out + 1] = glitch(utf8.len(name) or #name)
+                changed = true
+            else
+                out[#out + 1] = text:sub(i, e_)
+            end
+            i = e_ + 1
+        end
+        out[#out + 1] = text:sub(i)
+        text = table.concat(out)
+    end
+    return text, changed
+end
+
+local identity = { on = false, targets = {}, token = 0 }
+
+local function untrack(label, restore)
+    local t = identity.targets[label]
+    if not t then return end
+    if t.conn then t.conn:Disconnect() end
+    identity.targets[label] = nil
+    if restore and label.Parent then label.Text = t.orig end
+end
+
+local function tryRegister(label)
+    if identity.targets[label] then return end
+    local text = label.Text
+    if text == "" then return end
+    local _, found = scramble(text)
+    if not found then return end
+
+    local t = { orig = text, last = text, ext = 0 }
+    identity.targets[label] = t
+    t.conn = label:GetPropertyChangedSignal("Text"):Connect(function()
+        if not identity.on then return end
+        local cur = label.Text
+        if cur == t.last then return end -- perubahan dari kita sendiri
+        local _, still = scramble(cur)
+        if not still then untrack(label, false) return end -- game menimpa dengan teks lain
+        t.orig = cur -- game memperbarui teks (mis. level naik): samarkan langsung
+        t.ext += 1
+        if t.ext <= 20 then
+            t.last = scramble(cur)
+            label.Text = t.last
+        end
+    end)
+end
+
+local function isTextGui(d) return d:IsA("TextLabel") or d:IsA("TextButton") end
+
+local function scanGui(root)
+    local ok, desc = pcall(function() return root:GetDescendants() end)
+    if not ok then return end
+    for i, d in ipairs(desc) do
+        if isTextGui(d) then tryRegister(d) end
+        if i % 3000 == 0 then task.wait() end -- UI game besar, jangan bikin hitch
+    end
+end
+
+local function setHideIdentity(on)
+    on = on and true or false
+    if on == identity.on then return end
+    identity.on = on
+    identity.token += 1
+    local token = identity.token
+
+    if on then
+        tryRegister(nameLabel)
+        tryRegister(subLabel)
+
+        local pg = lp:FindFirstChildOfClass("PlayerGui")
+        if pg then
+            task.spawn(scanGui, pg)
+            identity.added = pg.DescendantAdded:Connect(function(d)
+                if isTextGui(d) then task.defer(tryRegister, d) end
+            end)
+        end
+
+        local acc = 0
+        identity.render = IdentityRun.RenderStepped:Connect(function(dt)
+            acc += dt
+            if acc < IDENTITY_INTERVAL then return end
+            acc = 0
+            for label, t in pairs(identity.targets) do
+                if label.Parent then
+                    local new_ = scramble(t.orig)
+                    t.last = new_
+                    t.ext = 0
+                    label.Text = new_
+                else
+                    untrack(label, false)
+                end
+            end
+            -- nama di atas kepala karakter (hanya tampilan lokal)
+            local char = lp.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if hum then hum.DisplayName = glitch(utf8.len(lp.DisplayName) or #lp.DisplayName) end
+        end)
+
+        -- teks baru di UI game yang memuat nama (mis. panel dibuka belakangan)
+        task.spawn(function()
+            while alive() and identity.on and identity.token == token do
+                task.wait(IDENTITY_RESCAN)
+                local pg2 = lp:FindFirstChildOfClass("PlayerGui")
+                if pg2 and identity.on and identity.token == token then scanGui(pg2) end
+            end
+        end)
+    else
+        if identity.render then identity.render:Disconnect() identity.render = nil end
+        if identity.added then identity.added:Disconnect() identity.added = nil end
+        for label in pairs(identity.targets) do untrack(label, true) end -- kembalikan teks asli
+        local char = lp.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if hum then hum.DisplayName = lp.DisplayName end
+    end
 end
 
 -- ===== FARM TAB (left column = 1, right column = 2) =====
@@ -1065,6 +1273,7 @@ toggleRow(s7, "Auto Reconnect", "autoReconnect")
 
 local s8 = section(pageFarm, 2, "Utilities")
 toggleRow(s8, "Anti AFK", "antiAfk", setAntiAfk)
+toggleRow(s8, "Hide Identity", "hideIdentity", setHideIdentity)
 
 -- ===== STATS TAB =====
 local statLabels = {}
@@ -1087,6 +1296,8 @@ for _, n in ipairs({ "Bank", "Withdraw", "Refuel", "Repair", "Claims" }) do stat
 local st4 = section(pageStats, 2, "Last action")
 statRow(st4, "Action", 72)
 
+applyLayout(fullW)
+
 local function fmt(n)
     n = math.floor((tonumber(n) or 0) + 0.5)
     local neg = n < 0
@@ -1101,12 +1312,12 @@ local function fmtTime(sec)
 end
 
 -- ===== FOOTER =====
-local footer = new("Frame", { Size = UDim2.new(1, 0, 0, FOOTER), Position = UDim2.new(0, 0, 1, -FOOTER), BackgroundTransparency = 1 }, main)
+local footer = new("CanvasGroup", { Size = UDim2.new(1, 0, 0, FOOTER), Position = UDim2.new(0, 0, 1, -FOOTER), BackgroundTransparency = 1 }, main)
 new("Frame", { Size = UDim2.new(1, -28, 0, 1), Position = UDim2.fromOffset(14, 0), BackgroundColor3 = C.white, BackgroundTransparency = 0.9, BorderSizePixel = 0 }, footer)
 local dot = new("Frame", { Size = UDim2.fromOffset(8, 8), Position = UDim2.fromOffset(16, 13), BackgroundColor3 = C.green }, footer)
 new("UICorner", { CornerRadius = UDim.new(1, 0) }, dot)
 local footerText = new("TextLabel", {
-    Size = UDim2.new(1, -50, 1, -2), Position = UDim2.fromOffset(34, 2), BackgroundTransparency = 1, Text = stats.lastAction,
+    Size = UDim2.new(1, -84, 1, -2), Position = UDim2.fromOffset(34, 2), BackgroundTransparency = 1, Text = stats.lastAction,
     TextColor3 = C.sub, Font = Enum.Font.Gotham, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left,
     TextTruncate = Enum.TextTruncate.AtEnd,
 }, footer)
@@ -1175,6 +1386,7 @@ end
 local function cleanup()
     env.FleetEmpireRun = -1
     setAntiAfk(false)
+    pcall(setHideIdentity, false)
     for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
     pcall(function() gui:Destroy() end)
 end
@@ -1186,24 +1398,147 @@ closeBtn.MouseButton1Click:Connect(function()
     closeAnim(cleanup)
 end)
 
-minBtn.MouseButton1Click:Connect(function()
-    minimized = not minimized
-    local function setContent(show)
-        tabControl.Visible = show
-        footer.Visible = show
-        pages[activeKey].Visible = show
+-- ===== ukuran window: selalu menjaga pojok kiri-atas tetap di tempat =====
+local winBusyUntil = 0
+local function setWindowSize(w, h, animate, duration)
+    local s_ = scale.Scale
+    local cur = main.Size
+    local pos = main.Position
+    local newPos = UDim2.new(
+        pos.X.Scale, pos.X.Offset + (w - cur.X.Offset) * s_ / 2,
+        pos.Y.Scale, pos.Y.Offset + (h - cur.Y.Offset) * s_ / 2
+    )
+    if animate then
+        tween(main, duration or 0.45, { Size = UDim2.fromOffset(w, h), Position = newPos }, Enum.EasingStyle.Quint)
+    else
+        main.Size = UDim2.fromOffset(w, h)
+        main.Position = newPos
     end
+end
+
+local function maxWindowSize()
+    local s_ = scale.Scale
+    local g = gui.AbsoluteSize
+    local tl = main.AbsolutePosition - gui.AbsolutePosition
+    return math.max(math.floor((g.X - tl.X - 8) / s_), MIN_W), math.max(math.floor((g.Y - tl.Y - 8) / s_), MIN_H)
+end
+
+-- ===== RESIZE HANDLE: ikon diagonal di pojok kanan bawah (klik/tahan lalu drag) =====
+local resizing = false
+local resizeBtn = new("TextButton", {
+    Name = "ResizeHandle", Size = UDim2.fromOffset(30, 30), AnchorPoint = Vector2.new(1, 1),
+    Position = UDim2.new(1, -6, 1, -4), BackgroundTransparency = 1, Text = "", AutoButtonColor = false, ZIndex = 20,
+}, main)
+local gripLines = {}
+for _, k in ipairs({ { 3, 7 }, { 7, 13 }, { 11, 19 } }) do -- {jarak dari pojok, panjang garis}
+    local line = new("Frame", {
+        Size = UDim2.fromOffset(k[2], 2), AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromOffset(24 - k[1], 24 - k[1]), Rotation = -45,
+        BackgroundColor3 = C.white, BackgroundTransparency = 0.5, BorderSizePixel = 0, ZIndex = 21,
+    }, resizeBtn)
+    new("UICorner", { CornerRadius = UDim.new(1, 0) }, line)
+    gripLines[#gripLines + 1] = line
+end
+local function gripGlow(on)
+    for _, l in ipairs(gripLines) do
+        tween(l, 0.15, { BackgroundTransparency = on and 0.05 or 0.5, BackgroundColor3 = on and C.blue or C.white })
+    end
+end
+resizeBtn.MouseEnter:Connect(function() gripGlow(true) end)
+resizeBtn.MouseLeave:Connect(function() if not resizing then gripGlow(false) end end)
+
+local rStart, rSize, rPos, rScale, rMaxW, rMaxH
+local lastHandleTap = 0
+
+local function saveWindowSize()
+    cfg.winW, cfg.winH = math.floor(fullW), math.floor(fullH)
+    saveCfg()
+end
+
+track(resizeBtn.InputBegan:Connect(function(i)
+    if minimized or os.clock() < winBusyUntil then return end
+    if i.UserInputType ~= Enum.UserInputType.MouseButton1 and i.UserInputType ~= Enum.UserInputType.Touch then return end
+
+    -- tap 2x cepat = kembalikan ke ukuran default
+    local now = os.clock()
+    if now - lastHandleTap < 0.35 then
+        lastHandleTap = 0
+        local mw, mh = maxWindowSize()
+        fullW, fullH = math.min(W, mw), math.min(H, mh)
+        setWindowSize(fullW, fullH, true, 0.35)
+        applyLayout(fullW)
+        saveWindowSize()
+        return
+    end
+    lastHandleTap = now
+
+    resizing = true
+    rStart, rSize, rPos, rScale = i.Position, Vector2.new(fullW, fullH), main.Position, scale.Scale
+    rMaxW, rMaxH = maxWindowSize()
+    gripGlow(true)
+    i.Changed:Connect(function()
+        if i.UserInputState == Enum.UserInputState.End and resizing then
+            resizing = false
+            gripGlow(false)
+            saveWindowSize()
+        end
+    end)
+end))
+
+track(UIS.InputChanged:Connect(function(i)
+    if not resizing then return end
+    if i.UserInputType ~= Enum.UserInputType.MouseMovement and i.UserInputType ~= Enum.UserInputType.Touch then return end
+    local d = i.Position - rStart
+    local nw = math.floor(math.clamp(rSize.X + d.X / rScale, MIN_W, rMaxW))
+    local nh = math.floor(math.clamp(rSize.Y + d.Y / rScale, MIN_H, rMaxH))
+    fullW, fullH = nw, nh
+    main.Size = UDim2.fromOffset(nw, nh)
+    main.Position = UDim2.new(
+        rPos.X.Scale, rPos.X.Offset + (nw - rSize.X) * rScale / 2,
+        rPos.Y.Scale, rPos.Y.Offset + (nh - rSize.Y) * rScale / 2
+    )
+    applyLayout(nw) -- landscape <-> portrait (2 kolom <-> 1 kolom) otomatis
+end))
+
+-- ===== MINIMIZE: sisakan header + potong lebar jadi setengah (animasi) =====
+local function minimizedWidth()
+    return math.floor(math.clamp(fullW / 2, math.min(fullW, 250), fullW))
+end
+
+local function setContent(show)
+    tabControl.Visible = show
+    footer.Visible = show
+    pages[activeKey].Visible = show
+end
+
+local minToken = 0
+minBtn.MouseButton1Click:Connect(function()
+    if resizing then return end
+    minimized = not minimized
+    minToken += 1
+    local my = minToken
+    local dur = 0.45
+    winBusyUntil = os.clock() + dur
+
     if minimized then
-        task.delay(0.2, function() if minimized then setContent(false) end end)
+        resizeBtn.Visible = false
+        tween(footer, 0.15, { GroupTransparency = 1 })
+        setWindowSize(minimizedWidth(), HEADER, true, dur) -- isi terpotong mengikuti jendela yang mengecil
+        task.delay(dur + 0.02, function()
+            if minimized and minToken == my then setContent(false) end
+        end)
     else
         setContent(true)
+        footer.GroupTransparency = 1
+        applyLayout(fullW) -- layout disiapkan untuk lebar penuh sebelum melebar
+        setWindowSize(fullW, fullH, true, dur)
+        task.delay(dur * 0.55, function()
+            if not minimized and minToken == my then tween(footer, 0.25, { GroupTransparency = 0 }) end
+        end)
+        task.delay(dur, function()
+            if not minimized and minToken == my then resizeBtn.Visible = true end
+        end)
     end
-    local targetH = minimized and HEADER or H
-    local delta = (minimized and -(H - HEADER) or (H - HEADER)) / 2 * fit
-    tween(main, 0.45, {
-        Size = UDim2.fromOffset(W, targetH),
-        Position = UDim2.new(main.Position.X.Scale, main.Position.X.Offset, main.Position.Y.Scale, main.Position.Y.Offset + delta),
-    }, Enum.EasingStyle.Quint)
 end)
 
 track(UIS.InputBegan:Connect(function(i, processed)
@@ -1232,6 +1567,7 @@ end))
 -- MAIN LOOP
 ------------------------------------------------
 setAntiAfk(cfg.antiAfk)
+if cfg.hideIdentity then setHideIdentity(true) end
 openAnim()
 
 if cfg.autoExecute then
